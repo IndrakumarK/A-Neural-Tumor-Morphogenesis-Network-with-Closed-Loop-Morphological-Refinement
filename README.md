@@ -1,6 +1,6 @@
-# KE-NTMN
+# NTMN
 
-### Knowledge-Evolving Neural Tumor Morphogenesis Network with Closed-Loop Morphological Refinement for Multimodal Brain Tumor Segmentation
+### Neural Tumor Morphogenesis Network with Closed-Loop Morphological Refinement for Multimodal Brain Tumor Segmentation
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
@@ -8,9 +8,9 @@
 
 ## Overview
 
-This repository provides a research-oriented PyTorch implementation of **KE-NTMN**, a Knowledge-Evolving Neural Tumor Morphogenesis Network for multimodal brain tumor MRI segmentation.
+This repository provides a research-oriented PyTorch implementation of **NTMN**, a Neural Tumor Morphogenesis Network for multimodal brain tumor MRI segmentation.
 
-KE-NTMN uses a closed-loop structural refinement mechanism in which an intermediate segmentation is used to extract differentiable morphological information. This information is compared with a learned morphological expectation, and the resulting discrepancy is transformed into a residual structural correction that is incorporated into subsequent recurrent refinement stages.
+NTMN uses a closed-loop structural refinement mechanism in which an intermediate segmentation is used to extract differentiable morphological information. This information is compared with a learned morphological expectation, and the resulting discrepancy is transformed into a residual structural correction that is incorporated into subsequent recurrent refinement stages.
 
 The framework investigates morphology-conditioned recurrent refinement for tumor localization, boundary delineation, and structural consistency in multimodal brain MRI segmentation.
 
@@ -18,15 +18,15 @@ The framework investigates morphology-conditioned recurrent refinement for tumor
 
 ## Key Components
 
-The repository follows the principal conceptual stages of KE-NTMN:
+The repository follows the principal conceptual stages of NTMN:
 
 1. **MBNSS** — Morphology- and Boundary-Normal-Aware Skull Stripping
-2. **ASE** — Anatomical/Spatial Enhancement
+2. **ASE** — Anatomical State Encoder
 3. **ConvGRU structural-state evolution**
 4. **Intermediate tumor segmentation**
 5. **Differentiable morphological representation**
 6. **Learned morphological expectation**
-7. **Morphological knowledge discrepancy**
+7. **Morphological discrepancy**
 8. **Residual structural feedback**
 9. **Topology-aware refinement**
 10. **Local connectivity regularization**
@@ -65,7 +65,7 @@ The morphology representation includes area, centroid, covariance, elongation, s
  │ Expectation                 │
  │          │                  │
  │          ▼                  │
- │ Knowledge Discrepancy       │
+ │ Morphological Discrepancy   │
  │          │                  │
  │          ▼                  │
  │ Residual Structural         │
@@ -82,14 +82,10 @@ The morphology representation includes area, centroid, covariance, elongation, s
     Final Segmentation
 ```
 
-The term **knowledge evolution** refers to computational evolution of the learned structural representation across recurrent refinement stages. It does **not** refer to biological tumor growth or longitudinal disease progression.
-
----
-
 ## Repository Structure
 
 ```text
-KE-NTMN/
+NTMN/
 ├── README.md
 ├── LICENSE
 ├── requirements.txt
@@ -98,7 +94,7 @@ KE-NTMN/
 ├── train.py
 ├── evaluate.py
 ├── src/
-│   └── ketmn/
+│   └── ntmn/
         ├──__init__
 │       ├── data.py
 │       ├── losses.py
@@ -336,7 +332,7 @@ If you use this repository or the KE-NTMN methodology in academic work, please c
 
 ```bibtex
 @article{KE_NTMN_2026,
-  title   = {KE-NTMN: A Knowledge-Evolving Neural Tumor Morphogenesis Network with Closed-Loop Morphological Refinement for Multimodal Brain Tumor Segmentation},
+  title   = {KE-NTMN: A Neural Tumor Morphogenesis Network with Closed-Loop Morphological Refinement for Multimodal Brain Tumor Segmentation},
   year    = {2026},
   note    = {}
 }
