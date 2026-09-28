@@ -94,7 +94,7 @@ NTMN/
 ├── train.py
 ├── evaluate.py
 ├── src/
-│   └── ntmn/
+│   └── ketmn/
         ├──__init__
 │       ├── data.py
 │       ├── losses.py
