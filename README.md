@@ -27,7 +27,7 @@ The repository follows the principal conceptual stages of NTMN:
 5. **Differentiable morphological representation**
 6. **Learned morphological expectation**
 7. **Morphological discrepancy**
-8. **Residual structural feedback**
+8. **Morphology-conditioned residual structural feedback**
 9. **Topology-aware refinement**
 10. **Local connectivity regularization**
 11. **Normalized predictive entropy**
