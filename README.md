@@ -1,6 +1,6 @@
 # NTMN
 
-### Neural Tumor Morphogenesis Network with Closed-Loop Morphological Refinement for Multimodal Brain Tumor Segmentation
+### Neural Tumor Morphogenesis Network: Closed Loop Morphological Feedback for Multimodal Brain Tumor Segmentation
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
@@ -10,7 +10,7 @@
 
 This repository provides a research-oriented PyTorch implementation of **NTMN**, a Neural Tumor Morphogenesis Network for multimodal brain tumor MRI segmentation.
 
-NTMN uses a closed-loop structural refinement mechanism in which an intermediate segmentation is used to extract differentiable morphological information. This information is compared with a learned morphological expectation, and the resulting discrepancy is transformed into a residual structural correction that is incorporated into subsequent recurrent refinement stages.
+NTMN uses a closed-loop structural feedback mechanism in which an intermediate segmentation is used to extract differentiable morphological information. This information is compared with a learned morphological expectation, and the resulting discrepancy is transformed into a residual structural correction that is incorporated into subsequent recurrent refinement stages.
 
 The framework investigates morphology-conditioned recurrent refinement for tumor localization, boundary delineation, and structural consistency in multimodal brain MRI segmentation.
 
@@ -18,22 +18,23 @@ The framework investigates morphology-conditioned recurrent refinement for tumor
 
 ## Key Components
 
-The repository follows the principal conceptual stages of NTMN:
+The central contribution of NTMN is morphology conditioned recurrent
+structural feedback. The remaining components support the overall
+segmentation framework.
 
-1. **MBNSS** — Morphology- and Boundary-Normal-Aware Skull Stripping
-2. **ASE** — Anatomical State Encoder
-3. **ConvGRU structural-state evolution**
-4. **Intermediate tumor segmentation**
-5. **Differentiable morphological representation**
-6. **Learned morphological expectation**
-7. **Morphological discrepancy**
-8. **Morphology-conditioned residual structural feedback**
-9. **Topology-aware refinement**
-10. **Local connectivity regularization**
-11. **Normalized predictive entropy**
-12. **Final segmentation decoding**
+1. MBNSS
+2. ASE
+3. ConvGRU structural state evolution
+4. Intermediate tumor segmentation
+5. Differentiable morphological representation
+6. Learned morphological expectation
+7. Morphological discrepancy
+8. Morphology conditioned residual structural feedback
+9. Topology aware refinement
+10. Local connectivity regularization
+11. Normalized predictive entropy
+12. Final segmentation decoding
 
-The morphology representation includes area, centroid, covariance, elongation, soft boundary, and soft compactness.
 
 ---
 
@@ -94,8 +95,8 @@ NTMN/
 ├── train.py
 ├── evaluate.py
 ├── src/
-│   └── ketmn/
-        ├──__init__
+│   └── ntmn/
+        ├──__init__.py
 │       ├── data.py
 │       ├── losses.py
 │       ├── model.py
@@ -118,9 +119,10 @@ Datasets, medical images, model checkpoints, and experiment outputs are excluded
 
 ## Datasets
 
-- **UPENN-GBM:** https://www.cancerimagingarchive.net/collection/upenn-gbm/
-- **TCGA-GBM:** https://www.cancerimagingarchive.net/collection/tcga-gbm/
-- **MOTUM:** https://doi.gin.g-node.org/10.12751/g-node.tvzqc5/
+• **UPenn-GBM:** [The Cancer Imaging Archive](https://www.cancerimagingarchive.net/collection/upenn-gbm/)
+• **TCGA-GBM:** [The Cancer Imaging Archive](https://www.cancerimagingarchive.net/collection/tcga-gbm/)
+• **MOTUM:** [MOTUM Dataset](https://doi.gin.g-node.org/10.12751/g-node.tvzqc5/)
+
   
 ---
 ## Installation
@@ -128,8 +130,8 @@ Datasets, medical images, model checkpoints, and experiment outputs are excluded
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/IndrakumarK/A-Knowledge-Evolving-Neural-Tumor-Morphogenesis-Network-with-Closed-Loop-Morphological-Refinement.git
-cd A-Knowledge-Evolving-Neural-Tumor-Morphogenesis-Network-with-Closed-Loop-Morphological-Refinement
+git clone https://github.com/IndrakumarK/A-Neural-Tumor-Morphogenesis-Network-with-Closed-Loop-Morphological-Refinement.git
+cd A-Neural-Tumor-Morphogenesis-Network-with-Closed-Loop-Morphological-Refinement
 ```
 
 ### 2. Create a virtual environment
@@ -191,7 +193,7 @@ data/
         └── mask.npy
 ```
 
-Each modality is represented as a 2-D `256 × 256` array. The segmentation mask uses four labels: `0` background and `1–3` tumor classes.
+Each modality is represented as a 2-D `256 × 256` array. The network uses a four class output space with label 0 representing background and labels 1 to 3 representing tumor classes. Dataset specific annotations may differ in the availability of individual foreground classes; unavailable classes are excluded from the corresponding supervised losses and evaluation.
 
 The `.npy` representation is a generic repository format. Original NIfTI/DICOM data require appropriate dataset-specific conversion, registration, resampling, normalization, slice selection, and label mapping.
 
@@ -265,9 +267,12 @@ python evaluate.py \
     --split test
 ```
 
-The evaluator reports patient-level foreground Dice values and their mean and standard deviation.
+The evaluator reports patient level segmentation metrics for the
+held out test cases. Depending on the evaluation configuration, these
+include Dice, IoU, HD95, precision, sensitivity, specificity, and
+the structural measures used in the manuscript.
 
-For publication-level statistical analysis, retain patient-level predictions and analyze them directly rather than reconstructing statistics from aggregate dataset means.
+Patient level predictions and metric values should be retained for statistical analysis. Pooled statistics should be calculated from individual patient level observations rather than reconstructed from dataset level means.
 
 ---
 
@@ -305,14 +310,19 @@ Private clinical MRI data must remain confidential and must not be uploaded to t
 
 ## Results and Publication Data
 
-This repository does not fabricate or redistribute manuscript results.
+The repository does not include fabricated, synthetic, or unverified
+experimental results.
 
-Reported benchmark values should only be associated with this repository when they have been generated and verified using the corresponding experimental pipeline.
+Reported manuscript results should only be associated with this
+repository when they have been generated and verified using the
+corresponding experimental pipeline.
 
-- Comparator results should be labeled **Reproduced** only when the comparator was actually executed.
-- Published values should be clearly identified as **Published/Reported**.
-- Pooled statistics should be calculated from patient-level observations.
-- Statistical tests should use the actual paired patient-level values.
+• Comparator results should be labeled **Reproduced** only when the
+  comparator was actually executed.
+• Results obtained from published literature should be labeled
+  **Published/Reported**.
+• Pooled statistics should be calculated from patient level observations.
+• Statistical tests should use the actual paired patient level values.
 
 ---
 
@@ -320,7 +330,7 @@ Reported benchmark values should only be associated with this repository when th
 
 This repository is intended for **research purposes only**.
 
-KE-NTMN is not a clinically validated diagnostic system and should not be used as a substitute for professional medical judgment, diagnosis, treatment planning, or clinical decision-making.
+NTMN is not a clinically validated diagnostic system and should not be used as a substitute for professional medical judgment, diagnosis, treatment planning, or clinical decision making.
 
 The repository does not contain private clinical MRI data or patient-identifiable information.
 
@@ -328,15 +338,12 @@ The repository does not contain private clinical MRI data or patient-identifiabl
 
 ## Citation
 
-If you use this repository or the KE-NTMN methodology in academic work, please cite the associated manuscript:
-
-```bibtex
-@article{KE_NTMN_2026,
-  title   = {KE-NTMN: A Neural Tumor Morphogenesis Network with Closed-Loop Morphological Refinement for Multimodal Brain Tumor Segmentation},
+@article{NTMN2026,
+  title   = {Neural Tumor Morphogenesis Network: Closed-Loop Morphological Feedback for Brain Tumor Segmentation in Multimodal MRI},
+  author  = {},
   year    = {2026},
-  note    = {}
+  note    = {Manuscript}
 }
-```
 
 ## License
 
