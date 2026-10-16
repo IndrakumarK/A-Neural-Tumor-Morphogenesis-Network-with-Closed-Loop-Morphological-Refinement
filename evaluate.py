@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 from src.ketmn.data import BrainTumorDataset
 from src.ketmn.model import KE_NTMN
 
+
 DATASET_VALID_CLASSES = {
     "UPenn": np.array([True, True, True, True], dtype=bool),
     "UPenn-GBM": np.array([True, True, True, True], dtype=bool),
@@ -39,7 +40,10 @@ def get_dataset_name(batch, default_name=None):
 
 
 def get_valid_classes(batch, dataset_name, num_classes):
-   
+    """
+    Obtain the valid foreground classes for the dataset.
+    """
+
     if "valid_classes" in batch:
         valid_classes = batch["valid_classes"]
 
@@ -65,12 +69,99 @@ def get_valid_classes(batch, dataset_name, num_classes):
 
         return valid_classes
 
-        return np.ones(num_classes, dtype=bool)
+    return np.ones(num_classes, dtype=bool)
 
 
-def _surface_distance_hd95(pred_mask, target_mask):
-  
-    from scipy.ndimage import binary_erosion, distance_transform_edt
+def get_pixel_spacing(batch):
+    """
+    Obtain the in-plane pixel spacing in millimeters.
+
+    Expected format:
+        pixel_spacing = (row_spacing_mm, column_spacing_mm)
+
+    The spacing must correspond to the final image/mask resolution
+    used for evaluation.
+    """
+
+    if "pixel_spacing" not in batch:
+        raise KeyError(
+            "The dataset batch does not contain 'pixel_spacing'. "
+            "BrainTumorDataset must return the in-plane pixel spacing "
+            "in millimeters for each evaluated case."
+        )
+
+    spacing = batch["pixel_spacing"]
+
+    if torch.is_tensor(spacing):
+        spacing = spacing.detach().cpu().numpy()
+
+    spacing = np.asarray(spacing, dtype=np.float64)
+
+    # Typical DataLoader output for batch_size=1:
+    # [[row_spacing, column_spacing]]
+    if spacing.ndim == 2:
+        if spacing.shape[0] != 1:
+            raise ValueError(
+                "Expected one pixel-spacing pair per evaluated case "
+                f"for batch_size=1, but received shape {spacing.shape}."
+            )
+        spacing = spacing[0]
+
+    # Remove unnecessary singleton dimensions.
+    spacing = np.squeeze(spacing)
+
+    if spacing.size != 2:
+        raise ValueError(
+            "pixel_spacing must contain exactly two values: "
+            "(row_spacing_mm, column_spacing_mm). "
+            f"Received shape {spacing.shape}."
+        )
+
+    spacing = tuple(float(x) for x in spacing)
+
+    if not all(np.isfinite(x) and x > 0 for x in spacing):
+        raise ValueError(
+            "Pixel spacing values must be finite and greater than zero. "
+            f"Received {spacing}."
+        )
+
+    return spacing
+
+
+# ---------------------------------------------------------------------
+# HD95
+# ---------------------------------------------------------------------
+def _surface_distance_hd95(
+    pred_mask,
+    target_mask,
+    pixel_spacing,
+):
+    """
+    Compute the 95th-percentile bidirectional surface distance (HD95)
+    in millimeters for a 2-D segmentation mask.
+
+    Parameters
+    ----------
+    pred_mask : np.ndarray
+        Binary predicted segmentation mask.
+
+    target_mask : np.ndarray
+        Binary ground-truth segmentation mask.
+
+    pixel_spacing : tuple(float, float)
+        In-plane pixel spacing in millimeters:
+        (row_spacing_mm, column_spacing_mm).
+
+    Returns
+    -------
+    float
+        HD95 in millimeters.
+    """
+
+    from scipy.ndimage import (
+        binary_erosion,
+        distance_transform_edt,
+    )
 
     pred_mask = np.asarray(pred_mask, dtype=bool)
     target_mask = np.asarray(target_mask, dtype=bool)
@@ -78,9 +169,11 @@ def _surface_distance_hd95(pred_mask, target_mask):
     pred_empty = not pred_mask.any()
     target_empty = not target_mask.any()
 
+    # Both prediction and ground truth are empty.
     if pred_empty and target_empty:
         return 0.0
 
+    # One is empty while the other contains the class.
     if pred_empty or target_empty:
         return float("inf")
 
@@ -97,15 +190,26 @@ def _surface_distance_hd95(pred_mask, target_mask):
     if not pred_surface.any() or not target_surface.any():
         return 0.0
 
+    pixel_spacing = tuple(
+        float(x) for x in pixel_spacing
+    )
+
+    # Distance transform using physical pixel spacing.
+    # Returned distances are therefore in millimeters.
     target_distance = distance_transform_edt(
-        ~target_surface
+        ~target_surface,
+        sampling=pixel_spacing,
     )
 
     pred_distance = distance_transform_edt(
-        ~pred_surface
+        ~pred_surface,
+        sampling=pixel_spacing,
     )
 
+    # Predicted surface -> ground-truth surface
     pred_to_target = target_distance[pred_surface]
+
+    # Ground-truth surface -> predicted surface
     target_to_pred = pred_distance[target_surface]
 
     distances = np.concatenate(
@@ -118,12 +222,25 @@ def _surface_distance_hd95(pred_mask, target_mask):
     return float(np.percentile(distances, 95))
 
 
+# ---------------------------------------------------------------------
+# Patient-level metrics
+# ---------------------------------------------------------------------
 def compute_patient_metrics(
     prediction,
     target,
     valid_classes,
+    pixel_spacing,
     num_classes=4,
 ):
+    """
+    Compute patient-level segmentation metrics.
+
+    Metrics are calculated separately for each valid foreground
+    class and then averaged across the valid foreground classes.
+
+    HD95 is reported in millimeters.
+    """
+
     dice_scores = []
     iou_scores = []
     precision_scores = []
@@ -133,12 +250,15 @@ def compute_patient_metrics(
 
     for class_id in range(1, num_classes):
 
-            if not valid_classes[class_id]:
+        if not valid_classes[class_id]:
             continue
 
         pred_class = prediction == class_id
         target_class = target == class_id
 
+        # -------------------------------------------------------------
+        # Confusion components
+        # -------------------------------------------------------------
         tp = np.logical_and(
             pred_class,
             target_class,
@@ -224,11 +344,12 @@ def compute_patient_metrics(
             )
 
         # -------------------------------------------------------------
-        # HD95
+        # HD95 in millimeters
         # -------------------------------------------------------------
         hd95 = _surface_distance_hd95(
-            pred_class,
-            target_class,
+            pred_mask=pred_class,
+            target_mask=target_class,
+            pixel_spacing=pixel_spacing,
         )
 
         dice_scores.append(dice)
@@ -308,7 +429,8 @@ def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate KE-NTMN on a patient-level dataset split."
+            "Evaluate KE-NTMN on a patient-level dataset split "
+            "with physical-unit HD95."
         )
     )
 
@@ -517,6 +639,13 @@ def main():
             )
 
             # ---------------------------------------------------------
+            # Physical in-plane pixel spacing
+            # ---------------------------------------------------------
+            pixel_spacing = get_pixel_spacing(
+                batch
+            )
+
+            # ---------------------------------------------------------
             # Final KE-NTMN prediction
             # ---------------------------------------------------------
             output = model(images)
@@ -544,6 +673,7 @@ def main():
                 prediction=prediction,
                 target=target,
                 valid_classes=valid_classes,
+                pixel_spacing=pixel_spacing,
                 num_classes=num_classes,
             )
 
@@ -560,9 +690,11 @@ def main():
             print(
                 f"{case_id} | "
                 f"{dataset_name} | "
+                f"Spacing={pixel_spacing[0]:.4f} x "
+                f"{pixel_spacing[1]:.4f} mm | "
                 f"Dice={metrics['dice']:.4f} | "
                 f"IoU={metrics['iou']:.4f} | "
-                f"HD95={metrics['hd95']:.4f} | "
+                f"HD95={metrics['hd95']:.4f} mm | "
                 f"Precision={metrics['precision']:.4f} | "
                 f"Recall={metrics['recall']:.4f} | "
                 f"Specificity={metrics['specificity']:.4f}"
@@ -619,24 +751,35 @@ def main():
             dtype=np.float64,
         )
 
-         finite_values = values[
+        finite_values = values[
             np.isfinite(values)
         ]
 
         if len(finite_values) == 0:
             mean_value = float("inf")
             std_value = float("inf")
+
         else:
             mean_value = finite_values.mean()
             std_value = finite_values.std(
                 ddof=0
             )
 
-        print(
-            f"{metric.capitalize():<15}: "
-            f"{mean_value:.4f} ± "
-            f"{std_value:.4f}"
-        )
+        if metric == "hd95":
+
+            print(
+                f"{metric.capitalize():<15}: "
+                f"{mean_value:.4f} ± "
+                f"{std_value:.4f} mm"
+            )
+
+        else:
+
+            print(
+                f"{metric.capitalize():<15}: "
+                f"{mean_value:.4f} ± "
+                f"{std_value:.4f}"
+            )
 
     # -----------------------------------------------------------------
     # Dataset-wise summaries
@@ -666,6 +809,7 @@ def main():
             print(
                 f"\n{dataset_name}"
             )
+
             print(
                 f"Patients: {len(subset)}"
             )
@@ -687,17 +831,28 @@ def main():
                 if len(finite_values) == 0:
                     mean_value = float("inf")
                     std_value = float("inf")
+
                 else:
                     mean_value = finite_values.mean()
                     std_value = finite_values.std(
                         ddof=0
                     )
 
-                print(
-                    f"  {metric.capitalize():<13}: "
-                    f"{mean_value:.4f} ± "
-                    f"{std_value:.4f}"
-                )
+                if metric == "hd95":
+
+                    print(
+                        f"  {metric.capitalize():<13}: "
+                        f"{mean_value:.4f} ± "
+                        f"{std_value:.4f} mm"
+                    )
+
+                else:
+
+                    print(
+                        f"  {metric.capitalize():<13}: "
+                        f"{mean_value:.4f} ± "
+                        f"{std_value:.4f}"
+                    )
 
 
 if __name__ == "__main__":
