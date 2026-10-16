@@ -15,34 +15,39 @@ except ImportError as exc:
 
 class BrainTumorDataset(Dataset):
     """
-    Dataset loader for 2-D multimodal brain-tumor MRI segmentation.
+    Patient/case-level 2-D multimodal MRI dataset.
 
-    Expected directory structure:
+    Expected directory structure
+    ----------------------------
+    root/
+        case_001/
+            T1.npy
+            T1ce.npy
+            T2.npy
+            FLAIR.npy
+            mask.npy
+            spacing.npy
+        case_002/
+            T1.npy
+            T1ce.npy
+            T2.npy
+            FLAIR.npy
+            mask.npy
+            spacing.npy
+        ...
 
-        root/
-        ├── case_001/
-        │   ├── T1.npy
-        │   ├── T1ce.npy
-        │   ├── T2.npy
-        │   ├── FLAIR.npy
-        │   └── mask.npy
-        │
-        ├── case_002/
-        │   ├── T1.npy
-        │   ├── T1ce.npy
-        │   ├── T2.npy
-        │   ├── FLAIR.npy
-        │   └── mask.npy
-        │
-        └── ...
+    spacing.npy must contain:
+        [row_spacing_mm, column_spacing_mm]
 
-    Each MRI modality and mask must be a 2-D NumPy array.
+    The spacing must correspond to the final image/mask arrays stored
+    in the .npy files.
 
-    Important:
-        This loader does NOT invent or assume physical pixel spacing.
-        Therefore, HD95 calculated by evaluate.py is expressed in
-        image-array pixels unless spacing metadata is explicitly added
-        to the dataset and evaluation pipeline.
+    Class order
+    -----------
+    0 = Background
+    1 = NCR/NET
+    2 = Edema
+    3 = Enhancing Tumor
     """
 
     MODALITIES = (
@@ -52,14 +57,20 @@ class BrainTumorDataset(Dataset):
         "FLAIR",
     )
 
-    # Class order:
-    # 0 = Background
-    # 1 = NCR/NET
-    # 2 = Edema
-    # 3 = Enhancing Tumor
-
     DATASET_VALID_CLASSES = {
+        "UPenn": (
+            True,
+            True,
+            True,
+            True,
+        ),
         "UPenn-GBM": (
+            True,
+            True,
+            True,
+            True,
+        ),
+        "TCGA": (
             True,
             True,
             True,
@@ -91,30 +102,29 @@ class BrainTumorDataset(Dataset):
     ):
         self.root = Path(root)
 
-        self.image_size = tuple(image_size)
+        self.image_size = tuple(
+            int(x) for x in image_size
+        )
 
         self.num_classes = int(num_classes)
-
         self.augment = bool(augment)
-
-        self.dataset_name = dataset_name
+        self.dataset_name = str(dataset_name)
 
         self.rotation_degrees = float(
             rotation_degrees
         )
 
         self.scale_range = tuple(
-            scale_range
+            float(x) for x in scale_range
         )
 
-        # ---------------------------------------------------------
-        # Basic validation
-        # ---------------------------------------------------------
-
+        # -------------------------------------------------------------
+        # Basic configuration checks
+        # -------------------------------------------------------------
         if self.num_classes != 4:
             raise ValueError(
                 "KE-NTMN expects four segmentation classes: "
-                "Background, NCR/NET, Edema, and Enhancing Tumor."
+                "Background, NCR/NET, ED, and ET."
             )
 
         if self.dataset_name not in self.DATASET_VALID_CLASSES:
@@ -126,13 +136,11 @@ class BrainTumorDataset(Dataset):
 
         if len(self.image_size) != 2:
             raise ValueError(
-                "image_size must contain exactly two values, "
+                f"image_size must contain two values, "
                 f"got {self.image_size}"
             )
 
-        if (
-            self.rotation_degrees < 0
-        ):
+        if self.rotation_degrees < 0:
             raise ValueError(
                 "rotation_degrees must be non-negative."
             )
@@ -141,18 +149,15 @@ class BrainTumorDataset(Dataset):
             len(self.scale_range) != 2
             or self.scale_range[0] <= 0
             or self.scale_range[1] <= 0
-            or self.scale_range[0]
-            > self.scale_range[1]
+            or self.scale_range[0] > self.scale_range[1]
         ):
             raise ValueError(
-                f"Invalid scale_range: "
-                f"{self.scale_range}"
+                f"Invalid scale_range: {self.scale_range}"
             )
 
-        # ---------------------------------------------------------
-        # Root directory
-        # ---------------------------------------------------------
-
+        # -------------------------------------------------------------
+        # Dataset directory
+        # -------------------------------------------------------------
         if not self.root.exists():
             raise FileNotFoundError(
                 f"Dataset directory does not exist: "
@@ -164,10 +169,6 @@ class BrainTumorDataset(Dataset):
                 f"Dataset root is not a directory: "
                 f"{self.root}"
             )
-
-        # ---------------------------------------------------------
-        # Case directories
-        # ---------------------------------------------------------
 
         self.cases = sorted(
             case_dir
@@ -181,70 +182,48 @@ class BrainTumorDataset(Dataset):
                 f"{self.root}"
             )
 
-    # =============================================================
-    # Dataset length
-    # =============================================================
-
     def __len__(self):
         return len(self.cases)
 
-    # =============================================================
-    # Load one case
-    # =============================================================
-
+    # -----------------------------------------------------------------
+    # Case loading
+    # -----------------------------------------------------------------
     def _load_case(self, case_dir):
         """
-        Load four MRI modalities and segmentation mask.
-
-        Returns
-        -------
-        images : np.ndarray
-            Shape: [4, H, W]
-
-        mask : np.ndarray
-            Shape: [H, W]
+        Load four MRI modalities, segmentation mask,
+        and physical in-plane pixel spacing.
         """
 
         images = []
 
-        # ---------------------------------------------------------
-        # Load modalities
-        # ---------------------------------------------------------
-
+        # -------------------------------------------------------------
+        # MRI modalities
+        # -------------------------------------------------------------
         for modality in self.MODALITIES:
 
-            path = (
-                case_dir
-                / f"{modality}.npy"
-            )
+            path = case_dir / f"{modality}.npy"
 
             if not path.exists():
                 raise FileNotFoundError(
                     f"Missing modality file: {path}"
                 )
 
-            image = np.load(
-                path
-            ).astype(
+            image = np.load(path).astype(
                 np.float32
             )
 
             if image.ndim != 2:
                 raise ValueError(
-                    f"{path} must be a 2-D array, "
+                    f"{path} must contain a 2-D array, "
                     f"got shape {image.shape}"
                 )
 
             images.append(image)
 
-        # ---------------------------------------------------------
-        # Load segmentation mask
-        # ---------------------------------------------------------
-
-        mask_path = (
-            case_dir
-            / "mask.npy"
-        )
+        # -------------------------------------------------------------
+        # Segmentation mask
+        # -------------------------------------------------------------
+        mask_path = case_dir / "mask.npy"
 
         if not mask_path.exists():
             raise FileNotFoundError(
@@ -252,544 +231,439 @@ class BrainTumorDataset(Dataset):
                 f"{mask_path}"
             )
 
-        mask = np.load(
-            mask_path
-        ).astype(
-            np.int64
-        )
+        mask = np.load(mask_path)
 
         if mask.ndim != 2:
             raise ValueError(
-                f"{mask_path} must be a 2-D array, "
+                f"{mask_path} must contain a 2-D array, "
                 f"got shape {mask.shape}"
             )
 
-        # ---------------------------------------------------------
-        # Stack modalities
-        # ---------------------------------------------------------
+        # -------------------------------------------------------------
+        # Physical pixel spacing
+        # -------------------------------------------------------------
+        spacing_path = case_dir / "spacing.npy"
 
-        images = np.stack(
-            images,
-            axis=0
-        )
+        if not spacing_path.exists():
+            raise FileNotFoundError(
+                f"Missing physical pixel-spacing file: "
+                f"{spacing_path}\n"
+                f"Expected spacing.npy containing "
+                f"[row_spacing_mm, column_spacing_mm]."
+            )
 
-        # ---------------------------------------------------------
-        # Verify image/mask dimensions
-        # ---------------------------------------------------------
+        pixel_spacing = np.asarray(
+            np.load(spacing_path),
+            dtype=np.float64,
+        ).reshape(-1)
 
-        if images.shape[1:] != mask.shape:
+        if pixel_spacing.size != 2:
             raise ValueError(
-                f"Image/mask shape mismatch in "
-                f"{case_dir}: "
-                f"images={images.shape}, "
-                f"mask={mask.shape}"
+                f"{spacing_path} must contain exactly "
+                f"two values: "
+                f"[row_spacing_mm, column_spacing_mm]. "
+                f"Received shape {pixel_spacing.shape}."
             )
 
-        # ---------------------------------------------------------
-        # Verify all modalities have identical shape
-        # ---------------------------------------------------------
-
-        reference_shape = images[0].shape
-
-        for idx in range(
-            1,
-            images.shape[0]
+        if not np.all(
+            np.isfinite(pixel_spacing)
         ):
-            if images[idx].shape != reference_shape:
+            raise ValueError(
+                f"{spacing_path} contains non-finite "
+                f"pixel-spacing values: "
+                f"{pixel_spacing.tolist()}"
+            )
+
+        if np.any(pixel_spacing <= 0):
+            raise ValueError(
+                f"{spacing_path} contains invalid "
+                f"non-positive pixel spacing: "
+                f"{pixel_spacing.tolist()}"
+            )
+
+        # -------------------------------------------------------------
+        # Spatial consistency
+        # -------------------------------------------------------------
+        image_shape = images[0].shape
+
+        for modality, image in zip(
+            self.MODALITIES,
+            images,
+        ):
+            if image.shape != image_shape:
                 raise ValueError(
-                    f"Modality shape mismatch in "
-                    f"{case_dir}: "
-                    f"modality index {idx} has "
-                    f"shape {images[idx].shape}, "
-                    f"expected {reference_shape}"
+                    f"Spatial size mismatch in case "
+                    f"'{case_dir.name}': "
+                    f"{modality} has shape {image.shape}, "
+                    f"expected {image_shape}."
                 )
 
-        return images, mask
+        if mask.shape != image_shape:
+            raise ValueError(
+                f"Mask shape {mask.shape} does not "
+                f"match image shape {image_shape} "
+                f"in case '{case_dir.name}'."
+            )
 
-    # =============================================================
-    # Per-modality z-score normalization
-    # =============================================================
-
-    @staticmethod
-    def _zscore_normalize(
-        images
-    ):
-        """
-        Apply independent z-score normalization
-        to each MRI modality.
-        """
-
-        images = images.astype(
-            np.float32,
-            copy=True
+        return (
+            np.stack(images, axis=0),
+            mask,
+            pixel_spacing.astype(np.float32),
         )
 
-        for c in range(
+    # -----------------------------------------------------------------
+    # Normalization
+    # -----------------------------------------------------------------
+    @staticmethod
+    def _zscore(image):
+        mean = image.mean()
+        std = image.std()
+
+        if std < 1e-8:
+            return image - mean
+
+        return (image - mean) / std
+
+    def _normalize(self, images):
+
+        normalized = np.empty_like(
+            images,
+            dtype=np.float32,
+        )
+
+        for channel in range(
             images.shape[0]
         ):
-
-            channel = images[c]
-
-            mean = float(
-                channel.mean()
-            )
-
-            std = float(
-                channel.std()
-            )
-
-            if std < 1e-8:
-                images[c] = (
-                    channel - mean
+            normalized[channel] = (
+                self._zscore(
+                    images[channel]
                 )
+            )
 
-            else:
-                images[c] = (
-                    channel - mean
-                ) / std
+        return normalized
 
-        return images
-
-    # =============================================================
-    # Random horizontal flip
-    # =============================================================
-
+    # -----------------------------------------------------------------
+    # 2-D affine augmentation
+    # -----------------------------------------------------------------
     @staticmethod
-    def _horizontal_flip(
-        images,
-        mask
+    def _affine_transform_2d(
+        array,
+        angle_degrees,
+        scale,
+        order,
+        mode,
+        cval,
     ):
-        images = np.flip(
-            images,
-            axis=2
-        ).copy()
+        height, width = array.shape
 
-        mask = np.flip(
-            mask,
-            axis=1
-        ).copy()
-
-        return images, mask
-
-    # =============================================================
-    # Random vertical flip
-    # =============================================================
-
-    @staticmethod
-    def _vertical_flip(
-        images,
-        mask
-    ):
-        images = np.flip(
-            images,
-            axis=1
-        ).copy()
-
-        mask = np.flip(
-            mask,
-            axis=0
-        ).copy()
-
-        return images, mask
-
-    # =============================================================
-    # Small-angle rotation
-    # =============================================================
-
-    def _rotate(
-        self,
-        images,
-        mask,
-        angle
-    ):
-        """
-        Rotate images and mask using scipy affine_transform.
-
-        Images use linear interpolation.
-        Mask uses nearest-neighbor interpolation.
-        """
-
-        h, w = mask.shape
-
-        center = np.array(
-            [h / 2.0, w / 2.0],
-            dtype=np.float32
+        angle = np.deg2rad(
+            angle_degrees
         )
 
-        theta = np.deg2rad(
-            angle
-        )
+        cos_a = np.cos(angle)
+        sin_a = np.sin(angle)
 
-        cos_theta = np.cos(
-            theta
-        )
-
-        sin_theta = np.sin(
-            theta
-        )
-
-        rotation_matrix = np.array(
+        # Forward transformation:
+        # rotation followed by scaling.
+        forward = np.array(
             [
                 [
-                    cos_theta,
-                    -sin_theta,
+                    scale * cos_a,
+                    -scale * sin_a,
                 ],
                 [
-                    sin_theta,
-                    cos_theta,
+                    scale * sin_a,
+                    scale * cos_a,
                 ],
             ],
-            dtype=np.float32
+            dtype=np.float64,
+        )
+
+        # scipy.ndimage.affine_transform
+        # expects inverse mapping.
+        matrix = np.linalg.inv(
+            forward
+        )
+
+        center = np.array(
+            [
+                (height - 1) / 2.0,
+                (width - 1) / 2.0,
+            ],
+            dtype=np.float64,
         )
 
         offset = (
-            center
-            - rotation_matrix @ center
+            center - matrix @ center
         )
 
-        rotated_images = []
-
-        for c in range(
-            images.shape[0]
-        ):
-
-            rotated = affine_transform(
-                images[c],
-                matrix=rotation_matrix,
-                offset=offset,
-                order=1,
-                mode="constant",
-                cval=0.0
-            )
-
-            rotated_images.append(
-                rotated.astype(
-                    np.float32
-                )
-            )
-
-        rotated_images = np.stack(
-            rotated_images,
-            axis=0
-        )
-
-        rotated_mask = affine_transform(
-            mask,
-            matrix=rotation_matrix,
+        transformed = affine_transform(
+            array,
+            matrix=matrix,
             offset=offset,
-            order=0,
-            mode="constant",
-            cval=0
-        ).astype(
-            np.int64
+            output_shape=(
+                height,
+                width,
+            ),
+            order=order,
+            mode=mode,
+            cval=cval,
+            prefilter=(order > 1),
         )
 
-        return (
-            rotated_images,
-            rotated_mask
-        )
+        return transformed
 
-    # =============================================================
-    # Random scaling
-    # =============================================================
-
-    def _scale(
+    def _augment(
         self,
         images,
         mask,
-        scale
-    ):
-        """
-        Apply isotropic scaling while preserving
-        the final image dimensions.
-
-        Images use linear interpolation.
-        Mask uses nearest-neighbor interpolation.
-        """
-
-        h, w = mask.shape
-
-        center = np.array(
-            [h / 2.0, w / 2.0],
-            dtype=np.float32
-        )
-
-        scale_matrix = np.array(
-            [
-                [
-                    1.0 / scale,
-                    0.0
-                ],
-                [
-                    0.0,
-                    1.0 / scale
-                ],
-            ],
-            dtype=np.float32
-        )
-
-        offset = (
-            center
-            - scale_matrix @ center
-        )
-
-        scaled_images = []
-
-        for c in range(
-            images.shape[0]
-        ):
-
-            scaled = affine_transform(
-                images[c],
-                matrix=scale_matrix,
-                offset=offset,
-                output_shape=(h, w),
-                order=1,
-                mode="constant",
-                cval=0.0
-            )
-
-            scaled_images.append(
-                scaled.astype(
-                    np.float32
-                )
-            )
-
-        scaled_images = np.stack(
-            scaled_images,
-            axis=0
-        )
-
-        scaled_mask = affine_transform(
-            mask,
-            matrix=scale_matrix,
-            offset=offset,
-            output_shape=(h, w),
-            order=0,
-            mode="constant",
-            cval=0
-        ).astype(
-            np.int64
-        )
-
-        return (
-            scaled_images,
-            scaled_mask
-        )
-
-    # =============================================================
-    # Data augmentation
-    # =============================================================
-
-    def _apply_augmentation(
-        self,
-        images,
-        mask
     ):
 
-        # ---------------------------------------------------------
-        # Horizontal flip
-        # ---------------------------------------------------------
-
+        # -------------------------------------------------------------
+        # Random horizontal flip
+        # -------------------------------------------------------------
         if np.random.rand() < 0.5:
 
-            images, mask = (
-                self._horizontal_flip(
-                    images,
-                    mask
-                )
-            )
+            images = np.flip(
+                images,
+                axis=2,
+            ).copy()
 
-        # ---------------------------------------------------------
-        # Vertical flip
-        # ---------------------------------------------------------
+            mask = np.flip(
+                mask,
+                axis=1,
+            ).copy()
 
+        # -------------------------------------------------------------
+        # Random vertical flip
+        # -------------------------------------------------------------
         if np.random.rand() < 0.5:
 
-            images, mask = (
-                self._vertical_flip(
-                    images,
-                    mask
-                )
-            )
+            images = np.flip(
+                images,
+                axis=1,
+            ).copy()
 
-        # ---------------------------------------------------------
+            mask = np.flip(
+                mask,
+                axis=0,
+            ).copy()
+
+        # -------------------------------------------------------------
         # Small-angle rotation
-        # ---------------------------------------------------------
-
+        # -------------------------------------------------------------
         if np.random.rand() < 0.5:
 
             angle = np.random.uniform(
                 -self.rotation_degrees,
-                self.rotation_degrees
+                self.rotation_degrees,
             )
 
-            images, mask = (
-                self._rotate(
-                    images,
-                    mask,
-                    angle
+            transformed_images = (
+                np.empty_like(images)
+            )
+
+            for channel in range(
+                images.shape[0]
+            ):
+
+                transformed_images[
+                    channel
+                ] = self._affine_transform_2d(
+                    images[channel],
+                    angle_degrees=angle,
+                    scale=1.0,
+                    order=1,
+                    mode="constant",
+                    cval=0.0,
                 )
-            )
 
-        # ---------------------------------------------------------
+            mask = self._affine_transform_2d(
+                mask,
+                angle_degrees=angle,
+                scale=1.0,
+                order=0,
+                mode="constant",
+                cval=0,
+            ).astype(mask.dtype)
+
+            images = transformed_images
+
+        # -------------------------------------------------------------
         # Random scaling
-        # ---------------------------------------------------------
-
+        # -------------------------------------------------------------
         if np.random.rand() < 0.5:
 
             scale = np.random.uniform(
                 self.scale_range[0],
-                self.scale_range[1]
+                self.scale_range[1],
             )
 
-            images, mask = (
-                self._scale(
-                    images,
-                    mask,
-                    scale
-                )
+            transformed_images = (
+                np.empty_like(images)
             )
+
+            for channel in range(
+                images.shape[0]
+            ):
+
+                transformed_images[
+                    channel
+                ] = self._affine_transform_2d(
+                    images[channel],
+                    angle_degrees=0.0,
+                    scale=scale,
+                    order=1,
+                    mode="constant",
+                    cval=0.0,
+                )
+
+            mask = self._affine_transform_2d(
+                mask,
+                angle_degrees=0.0,
+                scale=scale,
+                order=0,
+                mode="constant",
+                cval=0,
+            ).astype(mask.dtype)
+
+            images = transformed_images
 
         return images, mask
 
-    # =============================================================
-    # Get item
-    # =============================================================
-
-    def __getitem__(
+    # -----------------------------------------------------------------
+    # Mask validation
+    # -----------------------------------------------------------------
+    def _validate_mask(
         self,
-        index
+        mask,
+        mask_path,
     ):
+
+        unique_labels = np.unique(mask)
+
+        if np.any(unique_labels < 0) or np.any(
+            unique_labels >= self.num_classes
+        ):
+            raise ValueError(
+                f"Invalid labels in {mask_path}: "
+                f"{unique_labels.tolist()}. "
+                f"Expected labels in "
+                f"[0, {self.num_classes - 1}]."
+            )
+
+        # MOTUM does not contain an independently
+        # annotated edema class.
+        if (
+            self.dataset_name == "MOTUM"
+            and 2 in unique_labels
+        ):
+            raise ValueError(
+                f"MOTUM mask '{mask_path}' "
+                f"contains label 2 (ED). "
+                "MOTUM does not provide an "
+                "independently annotated edema class. "
+                "Do not create an artificial edema "
+                "label during preprocessing."
+            )
+
+    # -----------------------------------------------------------------
+    # Dataset item
+    # -----------------------------------------------------------------
+    def __getitem__(self, index):
 
         case_dir = self.cases[index]
 
-        # ---------------------------------------------------------
-        # Load
-        # ---------------------------------------------------------
-
-        images, mask = (
-            self._load_case(
-                case_dir
-            )
+        (
+            images,
+            mask,
+            pixel_spacing,
+        ) = self._load_case(
+            case_dir
         )
 
-        # ---------------------------------------------------------
-        # Verify expected image size
-        # ---------------------------------------------------------
+        # -------------------------------------------------------------
+        # Per-modality z-score normalization
+        # -------------------------------------------------------------
+        images = self._normalize(
+            images
+        )
 
-        if (
-            images.shape[1:]
-            != self.image_size
-        ):
-
-            raise ValueError(
-                f"Case '{case_dir.name}' has "
-                f"image shape {images.shape[1:]}, "
-                f"but the configured image size is "
-                f"{self.image_size}. "
-                f"Resize/resample the data during "
-                f"preprocessing."
-            )
-
-        if (
-            mask.shape
-            != self.image_size
-        ):
-
-            raise ValueError(
-                f"Case '{case_dir.name}' has "
-                f"mask shape {mask.shape}, "
-                f"but the configured image size is "
-                f"{self.image_size}. "
-                f"Resize/resample the data during "
-                f"preprocessing."
-            )
-
-        # ---------------------------------------------------------
-        # Data augmentation
-        # ---------------------------------------------------------
-
+        # -------------------------------------------------------------
+        # Training augmentation
+        # -------------------------------------------------------------
         if self.augment:
 
-            images, mask = (
-                self._apply_augmentation(
-                    images,
-                    mask
-                )
+            images, mask = self._augment(
+                images,
+                mask,
             )
 
-        # ---------------------------------------------------------
-        # Per-modality z-score normalization
-        # ---------------------------------------------------------
-
-        images = (
-            self._zscore_normalize(
-                images
-            )
-        )
-
-        # ---------------------------------------------------------
-        # Verify mask labels
-        # ---------------------------------------------------------
-
-        unique_labels = np.unique(
-            mask
-        )
-
-        invalid_labels = (
-            unique_labels[
-                (unique_labels < 0)
-                | (
-                    unique_labels
-                    >= self.num_classes
-                )
-            ]
-        )
-
-        if invalid_labels.size > 0:
+        # -------------------------------------------------------------
+        # Input-size validation
+        # -------------------------------------------------------------
+        if images.shape[1:] != self.image_size:
 
             raise ValueError(
-                f"Case '{case_dir.name}' "
-                f"contains invalid mask labels: "
-                f"{invalid_labels.tolist()}"
+                f"Expected image size "
+                f"{self.image_size}, "
+                f"but case '{case_dir.name}' "
+                f"has image size "
+                f"{images.shape[1:]}. "
+                "Resize/resample the data "
+                "during preprocessing."
             )
 
-        # ---------------------------------------------------------
-        # Convert to tensors
-        # ---------------------------------------------------------
+        # -------------------------------------------------------------
+        # Mask validation
+        # -------------------------------------------------------------
+        mask = mask.astype(
+            np.int64
+        )
 
-        image_tensor = torch.from_numpy(
+        mask_path = (
+            case_dir / "mask.npy"
+        )
+
+        self._validate_mask(
+            mask,
+            mask_path,
+        )
+
+        # -------------------------------------------------------------
+        # Dataset-specific valid classes
+        # -------------------------------------------------------------
+        valid_classes = torch.tensor(
+            self.DATASET_VALID_CLASSES[
+                self.dataset_name
+            ],
+            dtype=torch.bool,
+        )
+
+        # -------------------------------------------------------------
+        # Convert to tensors
+        # -------------------------------------------------------------
+        images = torch.from_numpy(
             images.astype(
                 np.float32
             )
         )
 
-        mask_tensor = torch.from_numpy(
-            mask.astype(
-                np.int64
+        mask = torch.from_numpy(
+            mask
+        )
+
+        pixel_spacing = torch.from_numpy(
+            pixel_spacing.astype(
+                np.float32
             )
         )
 
-        # ---------------------------------------------------------
-        # Dataset-specific valid classes
-        # ---------------------------------------------------------
-
-        valid_classes = torch.tensor(
-            self.DATASET_VALID_CLASSES[
-                self.dataset_name
-            ],
-            dtype=torch.bool
-        )
-
-        # ---------------------------------------------------------
-        # Return interface expected by evaluate.py
-        # ---------------------------------------------------------
-
         return {
-            "image": image_tensor,
-            "mask": mask_tensor,
+            "image": images,
+            "mask": mask,
             "case_id": case_dir.name,
             "dataset": self.dataset_name,
             "valid_classes": valid_classes,
+            "pixel_spacing": pixel_spacing,
         }
