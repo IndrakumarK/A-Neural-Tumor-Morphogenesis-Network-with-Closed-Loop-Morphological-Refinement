@@ -1,3 +1,24 @@
+"""
+NTMN Evaluation Script.
+
+Patient-level evaluation of the Neural Tumor Morphogenesis Network
+(NTMN) on a selected dataset split.
+
+Metrics
+-------
+- Dice
+- IoU
+- HD95
+- Precision
+- Recall / Sensitivity
+- Specificity
+
+HD95 is computed in physical millimeters using the case-specific
+in-plane pixel spacing.
+
+The evaluator operates on the two-dimensional formulation of NTMN.
+"""
+
 import argparse
 from pathlib import Path
 
@@ -6,9 +27,13 @@ import torch
 import yaml
 from torch.utils.data import DataLoader
 
-from src.ketmn.data import BrainTumorDataset
-from src.ketmn.model import KE_NTMN
+from src.ntmn.data import BrainTumorDataset
+from src.ntmn.model import NTMN
 
+
+# =====================================================================
+# Dataset-specific valid classes
+# =====================================================================
 
 DATASET_VALID_CLASSES = {
     "UPenn": np.array(
@@ -43,7 +68,19 @@ def get_dataset_name(
     default_name=None,
 ):
     """
-    Obtain dataset name from the batch.
+    Obtain the dataset name from a batch.
+
+    Parameters
+    ----------
+    batch : dict
+        DataLoader batch.
+
+    default_name : str, optional
+        Fallback dataset name.
+
+    Returns
+    -------
+    str or None
     """
 
     if "dataset" in batch:
@@ -70,15 +107,17 @@ def get_valid_classes(
     num_classes,
 ):
     """
-    Obtain valid foreground classes for
-    the corresponding dataset.
+    Obtain valid classes for the corresponding dataset.
+
+    Dataset-specific unavailable foreground classes are excluded
+    from quantitative evaluation.
     """
 
     if "valid_classes" in batch:
 
-        valid_classes = (
-            batch["valid_classes"]
-        )
+        valid_classes = batch[
+            "valid_classes"
+        ]
 
         if torch.is_tensor(
             valid_classes
@@ -95,15 +134,13 @@ def get_valid_classes(
         )
 
         if valid_classes.ndim > 1:
-            valid_classes = (
-                valid_classes[0]
-            )
+            valid_classes = valid_classes[0]
 
-        return valid_classes.astype(
+        valid_classes = valid_classes.astype(
             bool
         )
 
-    if (
+    elif (
         dataset_name
         in DATASET_VALID_CLASSES
     ):
@@ -114,43 +151,40 @@ def get_valid_classes(
             ]
         )
 
-        if len(valid_classes) != num_classes:
-            raise ValueError(
-                f"Valid-class definition for "
-                f"{dataset_name} has "
-                f"{len(valid_classes)} classes, "
-                f"but model uses "
-                f"{num_classes} classes."
-            )
+    else:
 
-        return valid_classes
+        valid_classes = np.ones(
+            num_classes,
+            dtype=bool,
+        )
 
-    return np.ones(
-        num_classes,
-        dtype=bool,
-    )
+    if len(valid_classes) != num_classes:
+        raise ValueError(
+            f"Valid-class definition for "
+            f"{dataset_name} has "
+            f"{len(valid_classes)} classes, "
+            f"but the model uses "
+            f"{num_classes} classes."
+        )
+
+    return valid_classes
 
 
 def get_pixel_spacing(batch):
     """
-    Obtain the in-plane pixel spacing
-    in millimeters.
+    Obtain in-plane pixel spacing in millimeters.
 
     Expected format:
-        (row_spacing_mm, column_spacing_mm)
 
-    The spacing must correspond to the final
-    image/mask resolution used for evaluation.
+        (row_spacing_mm, column_spacing_mm)
     """
 
     if "pixel_spacing" not in batch:
-
         raise KeyError(
             "The dataset batch does not contain "
-            "'pixel_spacing'. "
-            "BrainTumorDataset must return the "
-            "in-plane pixel spacing in millimeters "
-            "for each evaluated case."
+            "'pixel_spacing'. BrainTumorDataset must "
+            "return the in-plane pixel spacing in "
+            "millimeters for each evaluated case."
         )
 
     spacing = batch[
@@ -160,7 +194,6 @@ def get_pixel_spacing(batch):
     if torch.is_tensor(
         spacing
     ):
-
         spacing = (
             spacing
             .detach()
@@ -178,12 +211,10 @@ def get_pixel_spacing(batch):
     if spacing.ndim == 2:
 
         if spacing.shape[0] != 1:
-
             raise ValueError(
-                "Expected one pixel-spacing "
-                "pair per evaluated case for "
-                "batch_size=1, but received "
-                f"shape {spacing.shape}."
+                "Expected one pixel-spacing pair "
+                "per evaluated case for batch_size=1, "
+                f"but received shape {spacing.shape}."
             )
 
         spacing = spacing[0]
@@ -193,7 +224,6 @@ def get_pixel_spacing(batch):
     )
 
     if spacing.size != 2:
-
         raise ValueError(
             "pixel_spacing must contain exactly "
             "two values: "
@@ -210,10 +240,9 @@ def get_pixel_spacing(batch):
         np.isfinite(x) and x > 0
         for x in spacing
     ):
-
         raise ValueError(
-            "Pixel spacing values must be "
-            "finite and greater than zero. "
+            "Pixel spacing values must be finite "
+            "and greater than zero. "
             f"Received {spacing}."
         )
 
@@ -230,26 +259,23 @@ def _surface_distance_hd95(
     pixel_spacing,
 ):
     """
-    Compute the 95th-percentile bidirectional
-    surface distance (HD95) in millimeters
-    for a 2-D segmentation mask.
+    Compute 2-D HD95 in millimeters.
 
     Parameters
     ----------
     pred_mask : np.ndarray
-        Binary predicted segmentation mask.
+        Binary predicted mask.
 
     target_mask : np.ndarray
-        Binary ground-truth segmentation mask.
+        Binary reference mask.
 
     pixel_spacing : tuple
-        In-plane pixel spacing in millimeters:
         (row_spacing_mm, column_spacing_mm).
 
     Returns
     -------
     float
-        HD95 in millimeters.
+        95th-percentile bidirectional surface distance in mm.
     """
 
     from scipy.ndimage import (
@@ -270,27 +296,30 @@ def _surface_distance_hd95(
     pred_empty = not pred_mask.any()
     target_empty = not target_mask.any()
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # Both masks empty
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+
     if (
         pred_empty
         and target_empty
     ):
         return 0.0
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # One mask empty
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+
     if (
         pred_empty
         or target_empty
     ):
         return float("inf")
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # Extract 2-D boundaries
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+
     pred_surface = (
         pred_mask
         ^ binary_erosion(
@@ -318,9 +347,10 @@ def _surface_distance_hd95(
         for x in pixel_spacing
     )
 
-    # -------------------------------------------------------------
-    # Physical distance transform
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Physical distance transforms
+    # ---------------------------------------------------------------
+
     target_distance = (
         distance_transform_edt(
             ~target_surface,
@@ -335,14 +365,14 @@ def _surface_distance_hd95(
         )
     )
 
-    # Predicted surface -> ground truth
+    # Predicted surface -> reference surface
     pred_to_target = (
         target_distance[
             pred_surface
         ]
     )
 
-    # Ground truth -> predicted surface
+    # Reference surface -> predicted surface
     target_to_pred = (
         pred_distance[
             target_surface
@@ -378,13 +408,31 @@ def compute_patient_metrics(
     """
     Compute patient-level segmentation metrics.
 
-    Metrics are calculated separately for
-    each valid foreground class and then
-    averaged across the valid foreground
-    classes.
+    Metrics are calculated separately for each valid foreground class
+    and then averaged across the valid foreground classes.
 
-    HD95 is reported in millimeters.
+    Background class 0 is excluded.
+
+    Returns
+    -------
+    dict
+        Patient-level metrics.
     """
+
+    prediction = np.asarray(
+        prediction
+    )
+
+    target = np.asarray(
+        target
+    )
+
+    if prediction.shape != target.shape:
+        raise ValueError(
+            "Prediction and target shapes do not match. "
+            f"prediction={prediction.shape}, "
+            f"target={target.shape}"
+        )
 
     dice_scores = []
     iou_scores = []
@@ -398,9 +446,10 @@ def compute_patient_metrics(
         num_classes,
     ):
 
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------
         # Skip unavailable classes
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------
+
         if not valid_classes[
             class_id
         ]:
@@ -414,9 +463,10 @@ def compute_patient_metrics(
             target == class_id
         )
 
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------
         # Confusion components
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------
+
         tp = np.logical_and(
             pred_class,
             target_class,
@@ -437,9 +487,10 @@ def compute_patient_metrics(
             ~target_class,
         ).sum()
 
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------
         # Dice
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------
+
         denominator = (
             pred_class.sum()
             + target_class.sum()
@@ -456,9 +507,10 @@ def compute_patient_metrics(
                 / denominator
             )
 
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------
         # IoU
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------
+
         union = (
             pred_class
             | target_class
@@ -474,17 +526,15 @@ def compute_patient_metrics(
                 tp / union
             )
 
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------
         # Precision
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------
+
         precision_denominator = (
             tp + fp
         )
 
-        if (
-            precision_denominator
-            == 0
-        ):
+        if precision_denominator == 0:
 
             precision = 1.0
 
@@ -495,17 +545,15 @@ def compute_patient_metrics(
                 / precision_denominator
             )
 
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------
         # Recall / sensitivity
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------
+
         recall_denominator = (
             tp + fn
         )
 
-        if (
-            recall_denominator
-            == 0
-        ):
+        if recall_denominator == 0:
 
             recall = 1.0
 
@@ -516,17 +564,15 @@ def compute_patient_metrics(
                 / recall_denominator
             )
 
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------
         # Specificity
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------
+
         specificity_denominator = (
             tn + fp
         )
 
-        if (
-            specificity_denominator
-            == 0
-        ):
+        if specificity_denominator == 0:
 
             specificity = 1.0
 
@@ -537,9 +583,10 @@ def compute_patient_metrics(
                 / specificity_denominator
             )
 
-        # ---------------------------------------------------------
-        # HD95 in millimeters
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------
+        # HD95
+        # -----------------------------------------------------------
+
         hd95 = (
             _surface_distance_hd95(
                 pred_mask=pred_class,
@@ -573,11 +620,9 @@ def compute_patient_metrics(
         )
 
     if not dice_scores:
-
         raise RuntimeError(
-            "No valid foreground classes "
-            "were available for quantitative "
-            "evaluation."
+            "No valid foreground classes were "
+            "available for quantitative evaluation."
         )
 
     return {
@@ -597,9 +642,7 @@ def compute_patient_metrics(
             np.mean(recall_scores)
         ),
         "specificity": float(
-            np.mean(
-                specificity_scores
-            )
+            np.mean(specificity_scores)
         ),
     }
 
@@ -614,7 +657,7 @@ def load_checkpoint(
     device,
 ):
     """
-    Load a saved KE-NTMN checkpoint.
+    Load an NTMN checkpoint.
     """
 
     checkpoint = torch.load(
@@ -647,9 +690,10 @@ def load_checkpoint(
 
         state_dict = checkpoint
 
-    # -------------------------------------------------------------
-    # Handle DataParallel checkpoints
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Remove DataParallel prefix when present
+    # ---------------------------------------------------------------
+
     cleaned_state_dict = {}
 
     for key, value in (
@@ -659,7 +703,6 @@ def load_checkpoint(
         if key.startswith(
             "module."
         ):
-
             key = key[
                 len("module.") :
             ]
@@ -684,9 +727,8 @@ def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate KE-NTMN on a "
-            "patient-level dataset split "
-            "with physical-unit HD95."
+            "Evaluate NTMN on a patient-level "
+            "dataset split using physical-unit HD95."
         )
     )
 
@@ -702,8 +744,7 @@ def main():
         "--checkpoint",
         required=True,
         help=(
-            "Path to the trained "
-            "KE-NTMN checkpoint."
+            "Path to the trained NTMN checkpoint."
         ),
     )
 
@@ -722,7 +763,7 @@ def main():
 
     parser.add_argument(
         "--dataset",
-        required=True,
+        default=None,
         choices=[
             "UPenn",
             "UPenn-GBM",
@@ -731,9 +772,9 @@ def main():
             "MOTUM",
         ],
         help=(
-            "Dataset name. This is required "
-            "because valid classes and dataset "
-            "metadata depend on the dataset."
+            "Optional dataset name. If omitted, "
+            "the evaluator uses the dataset name "
+            "provided by BrainTumorDataset."
         ),
     )
 
@@ -748,7 +789,6 @@ def main():
     )
 
     if not config_path.exists():
-
         raise FileNotFoundError(
             f"Configuration file not found: "
             f"{config_path}"
@@ -770,10 +810,13 @@ def main():
     # Device
     # =================================================================
 
+    training_config = config.get(
+        "training",
+        {},
+    )
+
     configured_device = (
-        config
-        .get("training", {})
-        .get(
+        training_config.get(
             "device",
             "cuda",
         )
@@ -799,7 +842,7 @@ def main():
     )
 
     # =================================================================
-    # Dataset configuration
+    # Data configuration
     # =================================================================
 
     data_config = config.get(
@@ -860,7 +903,7 @@ def main():
         {},
     )
 
-    recurrent_steps = (
+    recurrent_steps = int(
         model_config.get(
             "steps",
             model_config.get(
@@ -870,7 +913,7 @@ def main():
         )
     )
 
-    structural_dim = (
+    structural_dim = int(
         model_config.get(
             "structural_feature_dim",
             model_config.get(
@@ -884,7 +927,7 @@ def main():
     # Model
     # =================================================================
 
-    model = KE_NTMN(
+    model = NTMN(
         num_classes=num_classes,
         steps=recurrent_steps,
         structural_dim=structural_dim,
@@ -895,7 +938,6 @@ def main():
     )
 
     if not checkpoint_path.exists():
-
         raise FileNotFoundError(
             f"Checkpoint not found: "
             f"{checkpoint_path}"
@@ -920,8 +962,9 @@ def main():
         for batch in loader:
 
             # ---------------------------------------------------------
-            # Input
+            # Input MRI
             # ---------------------------------------------------------
+
             images = batch[
                 "image"
             ].to(
@@ -932,6 +975,7 @@ def main():
             # ---------------------------------------------------------
             # Ground truth
             # ---------------------------------------------------------
+
             target = (
                 batch["mask"]
                 .cpu()
@@ -941,6 +985,7 @@ def main():
             # ---------------------------------------------------------
             # Dataset
             # ---------------------------------------------------------
+
             dataset_name = (
                 get_dataset_name(
                     batch,
@@ -949,14 +994,16 @@ def main():
             )
 
             if dataset_name is None:
-
                 raise ValueError(
-                    "Dataset name is unavailable."
+                    "Dataset name is unavailable. "
+                    "Provide --dataset or ensure that "
+                    "BrainTumorDataset returns 'dataset'."
                 )
 
             # ---------------------------------------------------------
             # Valid classes
             # ---------------------------------------------------------
+
             valid_classes = (
                 get_valid_classes(
                     batch,
@@ -968,6 +1015,7 @@ def main():
             # ---------------------------------------------------------
             # Physical pixel spacing
             # ---------------------------------------------------------
+
             pixel_spacing = (
                 get_pixel_spacing(
                     batch
@@ -977,14 +1025,14 @@ def main():
             # ---------------------------------------------------------
             # Model prediction
             # ---------------------------------------------------------
+
             output = model(
                 images
             )
 
             if "prob" not in output:
-
                 raise KeyError(
-                    "KE_NTMN output must contain "
+                    "NTMN output must contain "
                     "the final probability map "
                     "under output['prob']."
                 )
@@ -1001,8 +1049,9 @@ def main():
             )
 
             # ---------------------------------------------------------
-            # Metrics
+            # Patient-level metrics
             # ---------------------------------------------------------
+
             metrics = (
                 compute_patient_metrics(
                     prediction=prediction,
@@ -1052,7 +1101,6 @@ def main():
     # =================================================================
 
     if not patient_results:
-
         raise RuntimeError(
             "No patients were found in "
             "the selected split."
@@ -1074,7 +1122,7 @@ def main():
     print("\n")
     print("=" * 72)
     print(
-        "KE-NTMN PATIENT-LEVEL EVALUATION"
+        "NTMN PATIENT-LEVEL EVALUATION"
     )
     print("=" * 72)
 
@@ -1087,9 +1135,11 @@ def main():
         f"Split: {args.split}"
     )
 
-    print(
-        f"Dataset: {args.dataset}"
-    )
+    if args.dataset is not None:
+        print(
+            f"Dataset argument: "
+            f"{args.dataset}"
+        )
 
     print("-" * 72)
 
@@ -1103,11 +1153,9 @@ def main():
             dtype=np.float64,
         )
 
-        finite_values = (
-            values[
-                np.isfinite(values)
-            ]
-        )
+        finite_values = values[
+            np.isfinite(values)
+        ]
 
         if len(
             finite_values
@@ -1136,7 +1184,7 @@ def main():
         if metric == "hd95":
 
             print(
-                f"{metric.capitalize():<15}: "
+                f"{metric.upper():<15}: "
                 f"{mean_value:.4f} ± "
                 f"{std_value:.4f} mm"
             )
@@ -1197,11 +1245,9 @@ def main():
                     dtype=np.float64,
                 )
 
-                finite_values = (
-                    values[
-                        np.isfinite(values)
-                    ]
-                )
+                finite_values = values[
+                    np.isfinite(values)
+                ]
 
                 if len(
                     finite_values
@@ -1231,7 +1277,7 @@ def main():
 
                     print(
                         f"  "
-                        f"{metric.capitalize():<13}: "
+                        f"{metric.upper():<13}: "
                         f"{mean_value:.4f} ± "
                         f"{std_value:.4f} mm"
                     )
@@ -1245,6 +1291,10 @@ def main():
                         f"{std_value:.4f}"
                     )
 
+
+# =====================================================================
+# Entry point
+# =====================================================================
 
 if __name__ == "__main__":
     main()
