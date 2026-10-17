@@ -1,5 +1,5 @@
 """
-KE-NTMN: Knowledge-Evolving Neural Tumor Morphogenesis Network.
+NTMN: Neural Tumor Morphogenesis Network.
 
 Research-oriented implementation for multimodal brain tumor
 MRI segmentation.
