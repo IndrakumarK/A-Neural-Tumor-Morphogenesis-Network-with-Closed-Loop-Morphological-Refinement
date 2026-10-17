@@ -1,6 +1,6 @@
-# NTMN
+## NTMN
 
-### Neural Tumor Morphogenesis Network: Closed Loop Morphological Feedback for Multimodal Brain Tumor Segmentation
+### Neural Tumor Morphogenesis Network: Closed-Loop Morphological Feedback for Multimodal Brain Tumor Segmentation
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
