@@ -1,14 +1,14 @@
 # Data Preparation
 
-The datasets used in the KE-NTMN study are not redistributed with this repository. Users must obtain the datasets from their respective official sources and comply with their individual access, licensing, and usage requirements.
+The datasets used in the NTMN study are not redistributed with this repository. Users must obtain the datasets from their respective official sources and comply with the applicable access, licensing, and usage requirements.
 
-The following datasets are used in the manuscript:
+The benchmark datasets used in the manuscript are:
 
-- UPenn-GBM
-- TCGA-GBM
-- MOTUM
+- **UPenn-GBM**
+- **TCGA-GBM**
+- **MOTUM**
 
-Private clinical MRI data used for external qualitative evaluation are **not included** in this repository and must not be redistributed.
+The independently collected clinical MRI cohort used for qualitative external assessment is not included in this repository. These clinical data are private and must not be redistributed.
 
 ## Dataset Organization
 
