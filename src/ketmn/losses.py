@@ -1,10 +1,25 @@
 """
-NTMN: Neural Tumor Morphogenesis Network.
+NTMN: Neural Tumor Morphogenesis Network
+========================================
 
-Loss functions for multimodal brain tumor segmentation,
-morphology-conditioned refinement, topology, connectivity,
-uncertainty consistency, and MBNSS.
+Loss functions for multimodal brain tumor segmentation, including:
+
+- Foreground multiclass Dice loss
+- Structural stability loss
+- Morphology estimation loss
+- Knowledge consistency loss
+- Differentiable topology loss
+- Local connectivity loss
+- Spatial smoothness loss
+- Predictive uncertainty consistency loss
+- MBNSS brain-mask loss
+- Complete weighted NTMN segmentation objective
+
+All losses are implemented using PyTorch and are differentiable
+where required for end-to-end training.
 """
+
+from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
@@ -16,25 +31,29 @@ import torch.nn.functional as F
 
 def _prepare_valid_classes(
     valid_classes,
-    batch_size,
-    num_classes,
-    device,
-):
+    batch_size: int,
+    num_classes: int,
+    device: torch.device,
+) -> torch.Tensor:
     """
     Prepare dataset-specific class-validity information.
 
+    Parameters
+    ----------
     valid_classes:
-        None
+        None:
             All classes are considered valid.
 
-        [C]
+        [C]:
             Same validity mask is applied to every sample.
 
-        [B, C]
+        [B, C]:
             Sample-specific validity mask.
 
-    Returns:
-        Boolean tensor of shape [B, C].
+    Returns
+    -------
+    torch.Tensor
+        Boolean tensor with shape [B, C].
     """
 
     if valid_classes is None:
@@ -55,7 +74,8 @@ def _prepare_valid_classes(
 
         if valid_classes.numel() != num_classes:
             raise ValueError(
-                "valid_classes must contain one entry per class."
+                "valid_classes must contain one entry "
+                "per class."
             )
 
         valid_classes = valid_classes.unsqueeze(0).expand(
@@ -76,7 +96,6 @@ def _prepare_valid_classes(
             )
 
     else:
-
         raise ValueError(
             "valid_classes must be a 1-D or 2-D tensor."
         )
@@ -86,21 +105,26 @@ def _prepare_valid_classes(
 
 def _foreground_valid_mask(
     valid_classes,
-    batch_size,
-    num_classes,
-    device,
-):
+    batch_size: int,
+    num_classes: int,
+    device: torch.device,
+) -> torch.Tensor:
     """
     Return validity information for foreground classes only.
 
     Background class 0 is excluded.
+
+    Returns
+    -------
+    torch.Tensor
+        Boolean tensor with shape [B, C-1].
     """
 
     valid_classes = _prepare_valid_classes(
-        valid_classes,
-        batch_size,
-        num_classes,
-        device,
+        valid_classes=valid_classes,
+        batch_size=batch_size,
+        num_classes=num_classes,
+        device=device,
     )
 
     return valid_classes[:, 1:]
@@ -111,20 +135,52 @@ def _foreground_valid_mask(
 # =====================================================================
 
 def dice_loss(
-    pred,
-    target,
-    num_classes=4,
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    num_classes: int | None = None,
     valid_classes=None,
-    smooth=1e-6,
-):
+    smooth: float = 1e-6,
+) -> torch.Tensor:
     """
     Foreground multiclass soft Dice loss.
 
-    Background is excluded.
+    Background class 0 is excluded.
 
-    Dataset-specific unavailable foreground classes are
-    excluded through valid_classes.
+    Dice is computed independently for every sample and
+    foreground class. Dataset-specific unavailable classes
+    are excluded through valid_classes.
+
+    Parameters
+    ----------
+    pred:
+        Segmentation logits with shape [B, C, H, W].
+
+    target:
+        Integer segmentation labels with shape [B, H, W].
+
+    num_classes:
+        Number of segmentation classes. If None, inferred
+        from pred.shape[1].
+
+    valid_classes:
+        Dataset-specific class availability mask.
+
+    smooth:
+        Numerical stability constant.
     """
+
+    if num_classes is None:
+        num_classes = pred.shape[1]
+
+    if pred.ndim != 4:
+        raise ValueError(
+            "pred must have shape [B, C, H, W]."
+        )
+
+    if target.ndim != 3:
+        raise ValueError(
+            "target must have shape [B, H, W]."
+        )
 
     probs = F.softmax(
         pred,
@@ -141,36 +197,36 @@ def dice_loss(
         2,
     ).float()
 
-    # -------------------------------------------------------------
-    # Foreground classes
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Foreground classes only
+    # ---------------------------------------------------------------
 
     probs_fg = probs[:, 1:]
     target_fg = target_one_hot[:, 1:]
 
     valid_fg = _foreground_valid_mask(
-        valid_classes,
-        pred.shape[0],
-        num_classes,
-        pred.device,
+        valid_classes=valid_classes,
+        batch_size=pred.shape[0],
+        num_classes=num_classes,
+        device=pred.device,
     )
 
-    # -------------------------------------------------------------
-    # Dice per foreground class
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Dice for every sample and foreground class
+    # ---------------------------------------------------------------
 
     intersection = (
         probs_fg * target_fg
     ).sum(
-        dim=(0, 2, 3)
+        dim=(2, 3)
     )
 
     denominator = (
         probs_fg.sum(
-            dim=(0, 2, 3)
+            dim=(2, 3)
         )
         + target_fg.sum(
-            dim=(0, 2, 3)
+            dim=(2, 3)
         )
     )
 
@@ -182,25 +238,36 @@ def dice_loss(
         + smooth
     )
 
-    # A foreground class is included when it is valid
-    # for at least one sample in the batch.
-    class_validity = (
-        valid_fg.sum(dim=0) > 0
+    # ---------------------------------------------------------------
+    # Dataset-specific class masking
+    # ---------------------------------------------------------------
+
+    mask = valid_fg.to(
+        dice.dtype
     )
 
-    if not torch.any(class_validity):
-        return pred.new_tensor(0.0)
+    valid_count = mask.sum().clamp_min(
+        1.0
+    )
 
-    return 1.0 - dice[class_validity].mean()
+    mean_dice = (
+        dice * mask
+    ).sum() / valid_count
+
+    return 1.0 - mean_dice
 
 
 # =====================================================================
 # Smoothness Loss
 # =====================================================================
 
-def smoothness_loss(pred):
+def smoothness_loss(
+    pred: torch.Tensor,
+) -> torch.Tensor:
     """
     Spatial smoothness regularization over foreground probabilities.
+
+    Horizontal and vertical probability differences are penalized.
     """
 
     probs = F.softmax(
@@ -232,19 +299,22 @@ def smoothness_loss(pred):
 # =====================================================================
 
 def structural_stability_loss(
-    current_state,
-    previous_state,
-):
+    current_state: torch.Tensor,
+    previous_state: torch.Tensor | None,
+) -> torch.Tensor:
     """
     Penalize excessive changes between consecutive recurrent
     structural states.
 
     The previous state is detached so that this term does not
-    propagate gradients backward through the previous recurrent stage.
+    propagate gradients backward through the previous recurrent
+    stage.
     """
 
     if previous_state is None:
-        return current_state.new_tensor(0.0)
+        return current_state.new_tensor(
+            0.0
+        )
 
     return torch.mean(
         torch.abs(
@@ -259,20 +329,29 @@ def structural_stability_loss(
 # =====================================================================
 
 def morphology_estimation_loss(
-    predicted_morphology,
-    target_morphology,
+    predicted_morphology: torch.Tensor,
+    target_morphology: torch.Tensor,
     valid_classes=None,
-    num_classes=4,
-):
+    num_classes: int = 4,
+) -> torch.Tensor:
     """
     Morphology estimation loss.
 
     Supports:
+
+        [B, D]
+
         [B, C, D]
+
         [B, C*D]
 
-    Dataset-specific unavailable classes are excluded.
+    Dataset-specific unavailable classes are excluded when
+    class-wise morphology is supplied.
     """
+
+    # ---------------------------------------------------------------
+    # No class-specific morphology
+    # ---------------------------------------------------------------
 
     if valid_classes is None:
         return F.mse_loss(
@@ -281,16 +360,15 @@ def morphology_estimation_loss(
         )
 
     valid_classes = _prepare_valid_classes(
-        valid_classes,
-        predicted_morphology.shape[0],
-        num_classes,
-        predicted_morphology.device,
+        valid_classes=valid_classes,
+        batch_size=predicted_morphology.shape[0],
+        num_classes=num_classes,
+        device=predicted_morphology.device,
     )
 
-    # -------------------------------------------------------------
-    # Case 1:
-    # [B, C, D]
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Case 1: [B, C, D]
+    # ---------------------------------------------------------------
 
     if predicted_morphology.ndim == 3:
 
@@ -300,7 +378,19 @@ def morphology_estimation_loss(
                 "shape [B, C, D]."
             )
 
-        mask = valid_classes[:, :, None].to(
+        if target_morphology.shape != predicted_morphology.shape:
+            raise ValueError(
+                "predicted_morphology and target_morphology "
+                "must have the same shape."
+            )
+
+        descriptor_dim = (
+            predicted_morphology.shape[2]
+        )
+
+        mask = valid_classes[
+            :, :, None
+        ].to(
             predicted_morphology.dtype
         )
 
@@ -309,18 +399,28 @@ def morphology_estimation_loss(
             - target_morphology
         ) ** 2
 
-        denominator = mask.sum().clamp_min(1.0)
+        denominator = (
+            mask.sum()
+            * descriptor_dim
+        ).clamp_min(
+            1.0
+        )
 
         return (
             squared_error * mask
         ).sum() / denominator
 
-    # -------------------------------------------------------------
-    # Case 2:
-    # [B, C*D]
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Case 2: [B, C*D]
+    # ---------------------------------------------------------------
 
     if predicted_morphology.ndim == 2:
+
+        if predicted_morphology.shape != target_morphology.shape:
+            raise ValueError(
+                "predicted_morphology and target_morphology "
+                "must have the same shape."
+            )
 
         if (
             predicted_morphology.shape[1]
@@ -349,7 +449,9 @@ def morphology_estimation_loss(
             descriptor_dim,
         )
 
-        mask = valid_classes[:, :, None].to(
+        mask = valid_classes[
+            :, :, None
+        ].to(
             pred.dtype
         )
 
@@ -360,11 +462,17 @@ def morphology_estimation_loss(
         denominator = (
             mask.sum()
             * descriptor_dim
-        ).clamp_min(1.0)
+        ).clamp_min(
+            1.0
+        )
 
         return (
             squared_error * mask
         ).sum() / denominator
+
+    # ---------------------------------------------------------------
+    # Generic fallback
+    # ---------------------------------------------------------------
 
     return F.mse_loss(
         predicted_morphology,
@@ -377,14 +485,14 @@ def morphology_estimation_loss(
 # =====================================================================
 
 def knowledge_consistency_loss(
-    predicted_morphology,
-    expected_morphology,
+    predicted_morphology: torch.Tensor,
+    expected_morphology: torch.Tensor,
     valid_classes=None,
-    num_classes=4,
-):
+    num_classes: int = 4,
+) -> torch.Tensor:
     """
-    Knowledge consistency between predicted morphology and
-    learned/expected morphology.
+    Knowledge consistency between prediction-derived morphology
+    and the learned/expected morphological representation.
     """
 
     return morphology_estimation_loss(
@@ -400,26 +508,26 @@ def knowledge_consistency_loss(
 # =====================================================================
 
 def _soft_euler_characteristic(
-    class_probability,
-):
+    class_probability: torch.Tensor,
+) -> torch.Tensor:
     """
     Differentiable soft Euler characteristic.
 
-    The implementation uses an 8-connected neighborhood consisting
-    of horizontal, vertical, and diagonal adjacency terms.
+    The implementation uses the specified 8-connected neighborhood
+    through horizontal, vertical, and diagonal adjacency terms.
     """
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # Soft vertices
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
 
     vertices = class_probability.sum(
         dim=(-2, -1)
     )
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # Soft edges
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
 
     right = torch.minimum(
         class_probability[:, :, :, 1:],
@@ -456,45 +564,66 @@ def _soft_euler_characteristic(
         + down_left
     )
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # Soft faces
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
 
-    p1 = class_probability[:, :, :-1, :-1]
-    p2 = class_probability[:, :, :-1, 1:]
-    p3 = class_probability[:, :, 1:, :-1]
-    p4 = class_probability[:, :, 1:, 1:]
+    p1 = class_probability[
+        :, :, :-1, :-1
+    ]
+
+    p2 = class_probability[
+        :, :, :-1, 1:
+    ]
+
+    p3 = class_probability[
+        :, :, 1:, :-1
+    ]
+
+    p4 = class_probability[
+        :, :, 1:, 1:
+    ]
 
     faces = torch.minimum(
-        torch.minimum(p1, p2),
-        torch.minimum(p3, p4),
+        torch.minimum(
+            p1,
+            p2,
+        ),
+        torch.minimum(
+            p3,
+            p4,
+        ),
     ).sum(
         dim=(-2, -1)
     )
 
-    return vertices - edges + faces
+    return (
+        vertices
+        - edges
+        + faces
+    )
 
 
 def _hard_euler_characteristic(
-    class_mask,
-):
+    class_mask: torch.Tensor,
+) -> torch.Tensor:
     """
     Hard Euler characteristic used for the ground-truth target.
     """
 
     class_mask = class_mask.float()
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # Vertices
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
 
     vertices = class_mask.sum(
         dim=(-2, -1)
     )
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # Edges
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
 
     right = (
         class_mask[:, :, :, 1:]
@@ -531,14 +660,25 @@ def _hard_euler_characteristic(
         + down_left
     )
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # Faces
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
 
-    p1 = class_mask[:, :, :-1, :-1]
-    p2 = class_mask[:, :, :-1, 1:]
-    p3 = class_mask[:, :, 1:, :-1]
-    p4 = class_mask[:, :, 1:, 1:]
+    p1 = class_mask[
+        :, :, :-1, :-1
+    ]
+
+    p2 = class_mask[
+        :, :, :-1, 1:
+    ]
+
+    p3 = class_mask[
+        :, :, 1:, :-1
+    ]
+
+    p4 = class_mask[
+        :, :, 1:, 1:
+    ]
 
     faces = (
         p1
@@ -549,16 +689,20 @@ def _hard_euler_characteristic(
         dim=(-2, -1)
     )
 
-    return vertices - edges + faces
+    return (
+        vertices
+        - edges
+        + faces
+    )
 
 
 def topology_loss(
-    prediction,
-    target,
+    prediction: torch.Tensor,
+    target: torch.Tensor,
     valid_classes=None,
-):
+) -> torch.Tensor:
     """
-    Topology-aware loss based on soft Euler characteristic.
+    Topology-aware loss based on the soft Euler characteristic.
 
     The loss is evaluated independently for each foreground class
     and excludes dataset-specific unavailable classes.
@@ -572,14 +716,19 @@ def topology_loss(
     num_classes = probs.shape[1]
 
     valid_fg = _foreground_valid_mask(
-        valid_classes,
-        prediction.shape[0],
-        num_classes,
-        prediction.device,
+        valid_classes=valid_classes,
+        batch_size=prediction.shape[0],
+        num_classes=num_classes,
+        device=prediction.device,
     )
 
-    total = prediction.new_tensor(0.0)
-    count = prediction.new_tensor(0.0)
+    total = prediction.new_tensor(
+        0.0
+    )
+
+    count = prediction.new_tensor(
+        0.0
+    )
 
     for class_idx in range(
         1,
@@ -609,7 +758,8 @@ def topology_loss(
         )
 
         class_loss = torch.abs(
-            pred_chi - target_chi
+            pred_chi
+            - target_chi
         )
 
         sample_valid = valid_fg[
@@ -618,14 +768,14 @@ def topology_loss(
         ].float()
 
         total = total + (
-            class_loss * sample_valid
+            class_loss
+            * sample_valid
         ).sum()
 
         count = count + sample_valid.sum()
 
-    return (
-        total
-        / count.clamp_min(1.0)
+    return total / count.clamp_min(
+        1.0
     )
 
 
@@ -634,8 +784,8 @@ def topology_loss(
 # =====================================================================
 
 def _local_adjacency(
-    class_probability,
-):
+    class_probability: torch.Tensor,
+) -> torch.Tensor:
     """
     Differentiable local adjacency using 8-neighbor relationships.
     """
@@ -677,8 +827,8 @@ def _local_adjacency(
 
 
 def _hard_local_adjacency(
-    class_mask,
-):
+    class_mask: torch.Tensor,
+) -> torch.Tensor:
     """
     Hard local adjacency computed from the reference mask.
     """
@@ -722,10 +872,10 @@ def _hard_local_adjacency(
 
 
 def connectivity_loss(
-    prediction,
-    target,
+    prediction: torch.Tensor,
+    target: torch.Tensor,
     valid_classes=None,
-):
+) -> torch.Tensor:
     """
     Local connectivity loss for foreground classes.
 
@@ -740,14 +890,19 @@ def connectivity_loss(
     num_classes = probs.shape[1]
 
     valid_fg = _foreground_valid_mask(
-        valid_classes,
-        prediction.shape[0],
-        num_classes,
-        prediction.device,
+        valid_classes=valid_classes,
+        batch_size=prediction.shape[0],
+        num_classes=num_classes,
+        device=prediction.device,
     )
 
-    total = prediction.new_tensor(0.0)
-    count = prediction.new_tensor(0.0)
+    total = prediction.new_tensor(
+        0.0
+    )
+
+    count = prediction.new_tensor(
+        0.0
+    )
 
     for class_idx in range(
         1,
@@ -777,7 +932,8 @@ def connectivity_loss(
         )
 
         class_loss = torch.abs(
-            pred_adj - target_adj
+            pred_adj
+            - target_adj
         ).squeeze(1)
 
         sample_valid = valid_fg[
@@ -786,14 +942,14 @@ def connectivity_loss(
         ].float()
 
         total = total + (
-            class_loss * sample_valid
+            class_loss
+            * sample_valid
         ).sum()
 
         count = count + sample_valid.sum()
 
-    return (
-        total
-        / count.clamp_min(1.0)
+    return total / count.clamp_min(
+        1.0
     )
 
 
@@ -802,21 +958,38 @@ def connectivity_loss(
 # =====================================================================
 
 def uncertainty_consistency_loss(
-    prediction,
-    target,
-    valid_region=None,
-):
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    valid_region: torch.Tensor | None = None,
+    valid_classes=None,
+) -> torch.Tensor:
     """
     Match normalized predictive entropy with local prediction error.
 
     Normalized predictive entropy:
+
         H(p) / log(C)
 
     Prediction error:
+
         1 - p(y_i | x_i)
 
-    valid_region can be supplied to exclude invalid or ignored
-    pixels from the uncertainty consistency objective.
+    Parameters
+    ----------
+    prediction:
+        Auxiliary prediction logits [B, C, H, W].
+
+    target:
+        Ground-truth labels [B, H, W].
+
+    valid_region:
+        Optional pixel-level validity mask [B, H, W].
+
+    valid_classes:
+        Dataset-level class availability mask.
+
+        This is accepted for compatibility with the training pipeline,
+        but it is not treated as an H x W pixel mask.
     """
 
     probs = F.softmax(
@@ -826,9 +999,9 @@ def uncertainty_consistency_loss(
 
     num_classes = probs.shape[1]
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # Normalized predictive entropy
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
 
     entropy = -(
         probs
@@ -852,9 +1025,9 @@ def uncertainty_consistency_loss(
         / max_entropy.clamp_min(1e-8)
     )
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # Ground-truth class probability
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
 
     target_clamped = target.long().clamp(
         min=0,
@@ -866,27 +1039,27 @@ def uncertainty_consistency_loss(
         index=target_clamped.unsqueeze(1),
     ).squeeze(1)
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # Local prediction error
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
 
     prediction_error = (
         1.0
         - target_probability
     )
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # Entropy-error consistency
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
 
     consistency_error = torch.abs(
         normalized_entropy
         - prediction_error
     )
 
-    # -------------------------------------------------------------
-    # Valid region
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Pixel-level validity
+    # ---------------------------------------------------------------
 
     if valid_region is None:
 
@@ -899,6 +1072,12 @@ def uncertainty_consistency_loss(
         valid_region = valid_region.to(
             consistency_error.dtype
         )
+
+        if valid_region.shape != consistency_error.shape:
+            raise ValueError(
+                "valid_region must have shape "
+                "[B, H, W]."
+            )
 
     denominator = (
         valid_region.sum()
@@ -916,8 +1095,8 @@ def uncertainty_consistency_loss(
 # =====================================================================
 
 def _soft_boundary(
-    probability,
-):
+    probability: torch.Tensor,
+) -> torch.Tensor:
     """
     Differentiable boundary magnitude.
     """
@@ -948,8 +1127,8 @@ def _soft_boundary(
 
 
 def _soft_normal(
-    probability,
-):
+    probability: torch.Tensor,
+) -> torch.Tensor:
     """
     Differentiable boundary-normal representation.
     """
@@ -991,33 +1170,34 @@ def _soft_normal(
 
 
 def _brain_morphology(
-    probability,
-):
+    probability: torch.Tensor,
+) -> torch.Tensor:
     """
     Compute differentiable brain-mask morphology descriptors.
 
     Descriptor order:
-        area
-        centroid_x
-        centroid_y
-        covariance_xx
-        covariance_xy
-        covariance_yx
-        covariance_yy
-        elongation
-        soft_boundary
-        soft_compactness
+
+        1. Area
+        2. Centroid x
+        3. Centroid y
+        4. Covariance xx
+        5. Covariance xy
+        6. Covariance yx
+        7. Covariance yy
+        8. Elongation
+        9. Soft boundary
+        10. Soft compactness
 
     Soft compactness:
-        4*pi*A / (B^2 + epsilon)
 
-    where:
-        A = soft area
-        B = soft boundary measure
+        C = 4*pi*A / (B^2 + epsilon)
     """
 
-    # Expected input:
-    # [B, 1, H, W]
+    if probability.ndim != 4:
+        raise ValueError(
+            "probability must have shape [B, 1, H, W]."
+        )
+
     probability = probability[:, 0]
 
     batch_size, height, width = (
@@ -1027,9 +1207,9 @@ def _brain_morphology(
     device = probability.device
     dtype = probability.dtype
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # Coordinate grid
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
 
     y_coords, x_coords = torch.meshgrid(
         torch.arange(
@@ -1053,9 +1233,9 @@ def _brain_morphology(
         dim=-1,
     )
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # Area
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
 
     area = probability.sum(
         dim=(1, 2),
@@ -1063,12 +1243,13 @@ def _brain_morphology(
     )
 
     denominator = (
-        area + 1e-6
+        area
+        + 1e-6
     )
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # Centroid
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
 
     centroid = (
         probability.unsqueeze(-1)
@@ -1077,9 +1258,9 @@ def _brain_morphology(
         dim=(1, 2)
     ) / denominator.squeeze(-1)
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # Covariance
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
 
     centered = (
         coords.unsqueeze(0)
@@ -1094,9 +1275,9 @@ def _brain_morphology(
         dim=(1, 2)
     ) / denominator
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # Elongation
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
 
     eigenvalues = torch.linalg.eigvalsh(
         covariance
@@ -1110,9 +1291,9 @@ def _brain_morphology(
         / (lambda_min + 1e-6)
     ).unsqueeze(-1)
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # Soft boundary
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
 
     boundary_map = _soft_boundary(
         probability.unsqueeze(1)
@@ -1123,12 +1304,9 @@ def _brain_morphology(
         keepdim=True,
     )
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # Soft compactness
-    #
-    # Manuscript definition:
-    #     C = 4*pi*A / (B^2 + epsilon)
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
 
     compactness = (
         4.0
@@ -1139,9 +1317,9 @@ def _brain_morphology(
         + 1e-6
     )
 
-    # -------------------------------------------------------------
-    # Descriptor vector
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Flatten descriptors
+    # ---------------------------------------------------------------
 
     area_n = area.squeeze(-1)
 
@@ -1180,31 +1358,35 @@ def _brain_morphology(
 # =====================================================================
 
 def mbnss_loss(
-    brain_prediction,
-    brain_target,
+    brain_prediction: torch.Tensor,
+    brain_target: torch.Tensor,
     morphology_mean=None,
     morphology_std=None,
-):
+) -> torch.Tensor:
     """
     Complete MBNSS objective.
 
-    Components:
-        Dice
-        Boundary-position loss
-        Boundary-normal consistency
-        Global morphology loss
+    Components
+    ----------
+    Brain-mask Dice:
+        1.00
 
-    Optional morphology_mean and morphology_std allow the
-    training-set-only descriptor normalization described in
-    the manuscript.
+    Boundary-position loss:
+        0.50
 
-    The normalization statistics must be computed from the
-    training data only.
+    Boundary-normal consistency:
+        0.25
+
+    Global morphology loss:
+        0.25
+
+    Optional morphology_mean and morphology_std provide
+    training-set-only descriptor normalization.
     """
 
-    # -------------------------------------------------------------
-    # Convert brain logits to probability of brain foreground
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Convert brain prediction to probability
+    # ---------------------------------------------------------------
 
     if brain_prediction.shape[1] == 2:
 
@@ -1222,11 +1404,19 @@ def mbnss_loss(
     brain_target = brain_target.float()
 
     if brain_target.ndim == 3:
-        brain_target = brain_target.unsqueeze(1)
+        brain_target = brain_target.unsqueeze(
+            1
+        )
 
-    # -------------------------------------------------------------
-    # Dice loss
-    # -------------------------------------------------------------
+    if brain_target.shape != brain_probability.shape:
+        raise ValueError(
+            "brain_target and brain_probability "
+            "must have the same shape."
+        )
+
+    # ---------------------------------------------------------------
+    # Brain-mask Dice
+    # ---------------------------------------------------------------
 
     intersection = (
         brain_probability
@@ -1257,9 +1447,9 @@ def mbnss_loss(
         - dice.mean()
     )
 
-    # -------------------------------------------------------------
-    # Boundary position loss
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Boundary position
+    # ---------------------------------------------------------------
 
     predicted_boundary = _soft_boundary(
         brain_probability
@@ -1274,9 +1464,9 @@ def mbnss_loss(
         - target_boundary
     ).mean()
 
-    # -------------------------------------------------------------
-    # Boundary-normal consistency loss
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Boundary normal consistency
+    # ---------------------------------------------------------------
 
     predicted_normal = _soft_normal(
         brain_probability
@@ -1298,9 +1488,9 @@ def mbnss_loss(
         - normal_cosine
     ).mean()
 
-    # -------------------------------------------------------------
-    # Global morphology loss
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Global morphology
+    # ---------------------------------------------------------------
 
     predicted_morphology = _brain_morphology(
         brain_probability
@@ -1310,9 +1500,9 @@ def mbnss_loss(
         brain_target
     )
 
-    # -------------------------------------------------------------
-    # Optional training-set descriptor normalization
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Optional training-set normalization
+    # ---------------------------------------------------------------
 
     if (
         morphology_mean is not None
@@ -1347,20 +1537,20 @@ def mbnss_loss(
             + 1e-6
         )
 
-    morphology_loss = torch.abs(
+    morphology_loss_value = torch.abs(
         predicted_morphology
         - target_morphology
     ).mean()
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # Complete MBNSS objective
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
 
     return (
         1.00 * dice_loss_value
         + 0.50 * boundary_position_loss
         + 0.25 * boundary_normal_loss
-        + 0.25 * morphology_loss
+        + 0.25 * morphology_loss_value
     )
 
 
@@ -1369,17 +1559,17 @@ def mbnss_loss(
 # =====================================================================
 
 def total_loss(
-    prediction,
-    target,
-    structural_stability=0.0,
-    morphology_estimation=0.0,
-    knowledge_consistency=0.0,
-    topology=0.0,
-    connectivity=0.0,
-    smoothness=0.0,
-    uncertainty_consistency=0.0,
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    structural_stability: torch.Tensor | float = 0.0,
+    morphology_estimation: torch.Tensor | float = 0.0,
+    knowledge_consistency: torch.Tensor | float = 0.0,
+    topology: torch.Tensor | float = 0.0,
+    connectivity: torch.Tensor | float = 0.0,
+    smoothness: torch.Tensor | float = 0.0,
+    uncertainty_consistency: torch.Tensor | float = 0.0,
     valid_classes=None,
-):
+) -> torch.Tensor:
     """
     Complete NTMN segmentation objective.
 
@@ -1387,18 +1577,23 @@ def total_loss(
 
         Foreground Dice             1.00
         Structural stability        0.20
-        Morphology estimation      0.20
-        Knowledge consistency      0.20
+        Morphology estimation       0.20
+        Knowledge consistency       0.20
         Topology                    0.10
         Connectivity                0.10
         Smoothness                  0.05
-        Uncertainty consistency    0.05
+        Uncertainty consistency     0.05
+
+    Note
+    ----
+    MBNSS is a separate auxiliary objective and is intentionally
+    kept separate from this tumor-segmentation objective.
     """
 
     foreground_dice = dice_loss(
         prediction,
         target,
-        num_classes=4,
+        num_classes=prediction.shape[1],
         valid_classes=valid_classes,
     )
 
