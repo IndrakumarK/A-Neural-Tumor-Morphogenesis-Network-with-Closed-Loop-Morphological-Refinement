@@ -1,14 +1,47 @@
+"""
+NTMN Training Script
+====================
+
+Neural Tumor Morphogenesis Network (NTMN)
+
+This script trains the NTMN model for multimodal brain tumor
+segmentation using the configuration specified in
+configs/default.yaml.
+
+Training configuration
+----------------------
+- 4 MRI modalities: T1, T1ce, T2, FLAIR
+- 2-D input
+- 256 x 256 spatial resolution
+- 4 output classes
+- 3 recurrent refinement stages
+- AdamW optimizer
+- Initial learning rate: 1e-4
+- Weight decay: 1e-4
+- Cosine annealing
+- Minimum learning rate: 1e-6
+- Batch size: 8
+- 150 epochs
+- FP32
+- Xavier initialization
+- Fixed random seed
+
+The best checkpoint is selected using validation Dice only.
+The test split is not used during training or model selection.
+"""
+
 import argparse
 import random
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 import yaml
 from torch.utils.data import DataLoader
 
-from src.ketmn.data import BrainTumorDataset
-from src.ketmn.losses import (
+from src.ntmn.data import BrainTumorDataset
+from src.ntmn.losses import (
     connectivity_loss,
     knowledge_consistency_loss,
     morphology_estimation_loss,
@@ -18,27 +51,52 @@ from src.ketmn.losses import (
     uncertainty_consistency_loss,
     dice_loss,
 )
-from src.ketmn.model import KE_NTMN
-from src.ketmn.morphology import morphology
+from src.ntmn.model import NTMN
+from src.ntmn.morphology import morphology
+
+
+# =====================================================================
+# Dataset-specific valid classes
+# =====================================================================
 
 DATASET_VALID_CLASSES = {
-    "UPenn": [True, True, True, True],
-    "UPenn-GBM": [True, True, True, True],
-    "TCGA": [True, True, True, True],
-    "TCGA-GBM": [True, True, True, True],
-    "MOTUM": [True, True, False, True],
+    "UPenn": np.array(
+        [True, True, True, True],
+        dtype=bool,
+    ),
+    "UPenn-GBM": np.array(
+        [True, True, True, True],
+        dtype=bool,
+    ),
+    "TCGA": np.array(
+        [True, True, True, True],
+        dtype=bool,
+    ),
+    "TCGA-GBM": np.array(
+        [True, True, True, True],
+        dtype=bool,
+    ),
+    "MOTUM": np.array(
+        [True, True, False, True],
+        dtype=bool,
+    ),
 }
 
 
-# ---------------------------------------------------------------------
+# =====================================================================
 # Reproducibility
-# ---------------------------------------------------------------------
-def set_seed(seed, deterministic=True):
-    """Set random seeds for reproducible experiments."""
+# =====================================================================
+
+def set_seed(
+    seed,
+    deterministic=True,
+):
+    """
+    Set random seeds for reproducible experiments.
+    """
 
     random.seed(seed)
     np.random.seed(seed)
-
     torch.manual_seed(seed)
 
     if torch.cuda.is_available():
@@ -52,17 +110,36 @@ def set_seed(seed, deterministic=True):
         torch.backends.cudnn.benchmark = True
 
 
-# ---------------------------------------------------------------------
+# =====================================================================
 # Valid-class handling
-# ---------------------------------------------------------------------
-def get_valid_classes(batch, dataset_name, num_classes):
-       if "valid_classes" in batch:
+# =====================================================================
 
-        valid_classes = batch["valid_classes"]
+def get_valid_classes(
+    batch,
+    dataset_name,
+    num_classes,
+):
+    """
+    Obtain valid foreground classes for the corresponding dataset.
 
-        if torch.is_tensor(valid_classes):
+    Dataset-specific unavailable classes are excluded from supervised
+    losses and quantitative evaluation.
+    """
+
+    if "valid_classes" in batch:
+
+        valid_classes = batch[
+            "valid_classes"
+        ]
+
+        if torch.is_tensor(
+            valid_classes
+        ):
             valid_classes = (
-                valid_classes.cpu().numpy()
+                valid_classes
+                .detach()
+                .cpu()
+                .numpy()
             )
 
         valid_classes = np.asarray(
@@ -105,7 +182,9 @@ def valid_classes_to_tensor(
     valid_classes,
     device,
 ):
-    """Convert valid-class flags to a tensor."""
+    """
+    Convert valid-class flags to a boolean tensor.
+    """
 
     return torch.as_tensor(
         valid_classes,
@@ -113,23 +192,36 @@ def valid_classes_to_tensor(
         device=device,
     )
 
-# ---------------------------------------------------------------------
+
+# =====================================================================
 # Dataset name
-# ---------------------------------------------------------------------
-def get_dataset_name(batch, default=None):
-    """Obtain dataset name from the batch."""
+# =====================================================================
+
+def get_dataset_name(
+    batch,
+    default=None,
+):
+    """
+    Obtain dataset name from the batch.
+    """
 
     if "dataset" in batch:
 
-        dataset_name = batch["dataset"]
+        dataset_name = batch[
+            "dataset"
+        ]
 
         if isinstance(
             dataset_name,
             (list, tuple),
         ):
-            return str(dataset_name[0])
+            return str(
+                dataset_name[0]
+            )
 
-        return str(dataset_name)
+        return str(
+            dataset_name
+        )
 
     if default is not None:
         return str(default)
@@ -137,15 +229,22 @@ def get_dataset_name(batch, default=None):
     return None
 
 
-# ---------------------------------------------------------------------
+# =====================================================================
 # Validation
-# ---------------------------------------------------------------------
+# =====================================================================
+
 def evaluate(
     model,
     loader,
     device,
     num_classes,
 ):
+    """
+    Evaluate the model on the validation split.
+
+    Validation Dice is computed over valid foreground classes.
+    """
+
     model.eval()
 
     scores = []
@@ -154,12 +253,16 @@ def evaluate(
 
         for batch in loader:
 
-            images = batch["image"].to(
+            images = batch[
+                "image"
+            ].to(
                 device,
                 non_blocking=True,
             )
 
-            target = batch["mask"].to(
+            target = batch[
+                "mask"
+            ].to(
                 device,
                 non_blocking=True,
             )
@@ -168,10 +271,12 @@ def evaluate(
                 batch
             )
 
-            valid_classes = get_valid_classes(
-                batch,
-                dataset_name,
-                num_classes,
+            valid_classes = (
+                get_valid_classes(
+                    batch,
+                    dataset_name,
+                    num_classes,
+                )
             )
 
             prediction = (
@@ -189,7 +294,10 @@ def evaluate(
                 # -----------------------------------------------------
                 # Skip unavailable classes
                 # -----------------------------------------------------
-                if not valid_classes[class_id]:
+
+                if not valid_classes[
+                    class_id
+                ]:
                     continue
 
                 pred_class = (
@@ -225,7 +333,9 @@ def evaluate(
                         / denominator.float()
                     )
 
-                class_scores.append(score)
+                class_scores.append(
+                    score
+                )
 
             if class_scores:
 
@@ -242,24 +352,48 @@ def evaluate(
         np.mean(scores)
     )
 
-# ---------------------------------------------------------------------
+
+# =====================================================================
 # Composite loss
-# ---------------------------------------------------------------------
+# =====================================================================
+
 def compute_loss(
     output,
     target,
     valid_classes,
     loss_config,
 ):
-   
-    prob = output["prob"]
-    logits = output["logits"]
+    """
+    Compute the complete NTMN training objective.
 
-    states = output["states"]
+    Components
+    ----------
+    - Foreground Dice
+    - Structural stability
+    - Morphology estimation
+    - Knowledge consistency
+    - Topology
+    - Connectivity
+    - Spatial smoothness
+    - Uncertainty consistency
+    """
 
-    # -------------------------------------------------------------
+    prob = output[
+        "prob"
+    ]
+
+    logits = output[
+        "logits"
+    ]
+
+    states = output[
+        "states"
+    ]
+
+    # ---------------------------------------------------------------
     # Foreground Dice
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+
     dice = dice_loss(
         logits,
         target,
@@ -267,12 +401,16 @@ def compute_loss(
         valid_classes=valid_classes,
     )
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # Structural stability
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+
     stability_terms = []
 
-    for i in range(1, len(states)):
+    for i in range(
+        1,
+        len(states),
+    ):
 
         stability_terms.append(
             structural_stability_loss(
@@ -293,9 +431,10 @@ def compute_loss(
             0.0
         )
 
-    # -------------------------------------------------------------
-    # Morphological supervision
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Ground-truth foreground morphology
+    # ---------------------------------------------------------------
+
     foreground_target = (
         (target > 0)
         .float()
@@ -305,6 +444,16 @@ def compute_loss(
     target_morphology = morphology(
         foreground_target
     )
+
+    # ---------------------------------------------------------------
+    # Prediction-derived morphology
+    # ---------------------------------------------------------------
+
+    if "morphology" not in output:
+        raise KeyError(
+            "NTMN output must contain "
+            "'morphology'."
+        )
 
     morphology_pred = output[
         "morphology"
@@ -317,12 +466,16 @@ def compute_loss(
         )
     )
 
-   if (
+    # ---------------------------------------------------------------
+    # Learned morphology expectation
+    # ---------------------------------------------------------------
+
+    if (
         "expected_morphology"
         not in output
     ):
         raise KeyError(
-            "KE_NTMN output must contain "
+            "NTMN output must contain "
             "'expected_morphology'."
         )
 
@@ -337,30 +490,37 @@ def compute_loss(
         )
     )
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # Topology
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+
     topology = topology_loss(
         prob,
         target,
         valid_classes=valid_classes,
     )
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # Connectivity
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+
     connectivity = connectivity_loss(
         prob,
         target=target,
         valid_classes=valid_classes,
     )
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # Spatial smoothness
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+
     smoothness = smoothness_loss(
         logits
     )
+
+    # ---------------------------------------------------------------
+    # Uncertainty consistency
+    # ---------------------------------------------------------------
 
     uncertainty_logits = output.get(
         "auxiliary_logits",
@@ -375,9 +535,10 @@ def compute_loss(
         )
     )
 
-    # -------------------------------------------------------------
-    # Manuscript loss weights
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Weighted total loss
+    # ---------------------------------------------------------------
+
     total = (
 
         loss_config.get(
@@ -432,26 +593,66 @@ def compute_loss(
     return total
 
 
-# ---------------------------------------------------------------------
+# =====================================================================
+# Xavier initialization
+# =====================================================================
+
+def initialize_xavier(
+    model,
+):
+    """
+    Apply Xavier uniform initialization to convolutional and
+    linear layers.
+    """
+
+    for module in model.modules():
+
+        if isinstance(
+            module,
+            (
+                nn.Conv2d,
+                nn.Linear,
+            ),
+        ):
+
+            nn.init.xavier_uniform_(
+                module.weight
+            )
+
+            if module.bias is not None:
+
+                nn.init.zeros_(
+                    module.bias
+                )
+
+
+# =====================================================================
 # Main
-# ---------------------------------------------------------------------
+# =====================================================================
+
 def main():
 
     parser = argparse.ArgumentParser(
-        description="Train KE-NTMN."
+        description=(
+            "Train the Neural Tumor "
+            "Morphogenesis Network (NTMN)."
+        )
     )
 
     parser.add_argument(
         "--config",
         default="configs/default.yaml",
-        help="Path to configuration YAML file.",
+        help=(
+            "Path to configuration YAML file."
+        ),
     )
 
     args = parser.parse_args()
 
-    # =============================================================
+    # =================================================================
     # Configuration
-    # =============================================================
+    # =================================================================
+
     config_path = Path(
         args.config
     )
@@ -467,11 +668,17 @@ def main():
         encoding="utf-8",
     ) as file:
 
-        config = yaml.safe_load(file)
+        config = yaml.safe_load(
+            file
+        )
 
-    # =============================================================
+    if config is None:
+        config = {}
+
+    # =================================================================
     # Reproducibility
-    # =============================================================
+    # =================================================================
+
     reproducibility_config = config.get(
         "reproducibility",
         {},
@@ -502,9 +709,10 @@ def main():
         f"Random seed: {seed}"
     )
 
-    # =============================================================
+    # =================================================================
     # Device
-    # =============================================================
+    # =================================================================
+
     configured_device = config.get(
         "project",
         {},
@@ -517,10 +725,13 @@ def main():
         configured_device == "cuda"
         and torch.cuda.is_available()
     ):
+
         device = torch.device(
             "cuda"
         )
+
     else:
+
         device = torch.device(
             "cpu"
         )
@@ -536,10 +747,13 @@ def main():
             f"{torch.cuda.get_device_name(0)}"
         )
 
-    # =============================================================
+    # =================================================================
     # Data configuration
-    # =============================================================
-    data_config = config["data"]
+    # =================================================================
+
+    data_config = config[
+        "data"
+    ]
 
     data_root = Path(
         data_config.get(
@@ -562,9 +776,10 @@ def main():
         )
     )
 
-    # =============================================================
+    # =================================================================
     # Datasets
-    # =============================================================
+    # =================================================================
+
     train_dataset = BrainTumorDataset(
         root=data_root / "train",
         image_size=image_size,
@@ -585,9 +800,10 @@ def main():
         augment=False,
     )
 
-    # =============================================================
+    # =================================================================
     # Data loaders
-    # =============================================================
+    # =================================================================
+
     training_config = config[
         "training"
     ]
@@ -629,9 +845,10 @@ def main():
         f"{len(val_dataset)}"
     )
 
-    # =============================================================
+    # =================================================================
     # Model
-    # =============================================================
+    # =================================================================
+
     model_config = config[
         "model"
     ]
@@ -641,25 +858,30 @@ def main():
         {},
     )
 
-    recurrent_steps = recurrent_config.get(
-        "steps",
-        3,
+    recurrent_steps = int(
+        recurrent_config.get(
+            "steps",
+            3,
+        )
     )
 
-    structural_dim = model_config.get(
-        "structural_feature_dim",
-        256,
+    structural_dim = int(
+        model_config.get(
+            "structural_feature_dim",
+            256,
+        )
     )
 
-    model = KE_NTMN(
+    model = NTMN(
         num_classes=num_classes,
         steps=recurrent_steps,
         structural_dim=structural_dim,
     ).to(device)
 
-    # =============================================================
+    # =================================================================
     # Xavier initialization
-    # =============================================================
+    # =================================================================
+
     initialization_method = (
         training_config.get(
             "initialization",
@@ -671,33 +893,20 @@ def main():
     )
 
     if (
-        initialization_method.lower()
+        str(
+            initialization_method
+        ).lower()
         == "xavier"
     ):
 
-        for module in model.modules():
+        initialize_xavier(
+            model
+        )
 
-            if isinstance(
-                module,
-                (
-                    nn.Conv2d,
-                    nn.Linear,
-                ),
-            ):
-
-                nn.init.xavier_uniform_(
-                    module.weight
-                )
-
-                if module.bias is not None:
-
-                    nn.init.zeros_(
-                        module.bias
-                    )
-
-    # =============================================================
+    # =================================================================
     # Optimizer
-    # =============================================================
+    # =================================================================
+
     optimizer_config = (
         training_config[
             "optimizer"
@@ -716,9 +925,10 @@ def main():
         ),
     )
 
-    # =============================================================
+    # =================================================================
     # Scheduler
-    # =============================================================
+    # =================================================================
+
     scheduler_config = (
         training_config.get(
             "scheduler",
@@ -744,17 +954,19 @@ def main():
         )
     )
 
-    # =============================================================
+    # =================================================================
     # Loss configuration
-    # =============================================================
+    # =================================================================
+
     loss_config = config.get(
         "loss",
         {},
     )
 
-    # =============================================================
+    # =================================================================
     # Checkpoint directory
-    # =============================================================
+    # =================================================================
+
     logging_config = config.get(
         "logging",
         {},
@@ -772,9 +984,10 @@ def main():
         exist_ok=True,
     )
 
-    # =============================================================
+    # =================================================================
     # Training
-    # =============================================================
+    # =================================================================
+
     best_val_dice = -float(
         "inf"
     )
@@ -804,8 +1017,10 @@ def main():
                 non_blocking=True,
             )
 
-            dataset_name = get_dataset_name(
-                batch
+            dataset_name = (
+                get_dataset_name(
+                    batch
+                )
             )
 
             valid_classes = (
@@ -823,10 +1038,10 @@ def main():
                 )
             )
 
-            # -----------------------------------------------------
-            # For MOTUM, the unavailable ED label must not occur
-            # in the supervised target.
-            # -----------------------------------------------------
+            # ---------------------------------------------------------
+            # Unavailable class handling
+            # ---------------------------------------------------------
+
             if not valid_classes[2]:
 
                 invalid_ed = (
@@ -836,22 +1051,29 @@ def main():
                 if invalid_ed.any():
 
                     raise ValueError(
-                        "MOTUM target contains "
-                        "the unavailable edema "
-                        "class (label 2). "
+                        "The target contains "
+                        "the unavailable class "
+                        "(label 2) for "
+                        f"{dataset_name}. "
                         "The preprocessing/label "
                         "harmonization step must "
                         "exclude this class rather "
-                        "than encode it as background."
+                        "than encode it as a "
+                        "foreground target."
                     )
+
+            # ---------------------------------------------------------
+            # Forward and loss
+            # ---------------------------------------------------------
 
             optimizer.zero_grad(
                 set_to_none=True
             )
 
+            # Target is NOT passed into the model.
+            # Ground truth is used by the loss only.
             output = model(
-                images,
-                target,
+                images
             )
 
             loss = compute_loss(
@@ -861,13 +1083,19 @@ def main():
                 loss_config,
             )
 
-            if not torch.isfinite(loss):
+            if not torch.isfinite(
+                loss
+            ):
 
                 raise FloatingPointError(
                     f"Non-finite loss detected "
                     f"at epoch {epoch}: "
                     f"{loss.item()}"
                 )
+
+            # ---------------------------------------------------------
+            # Backpropagation
+            # ---------------------------------------------------------
 
             loss.backward()
 
@@ -876,6 +1104,10 @@ def main():
             running_loss += (
                 loss.item()
             )
+
+        # =================================================================
+        # End epoch
+        # =================================================================
 
         scheduler.step()
 
@@ -886,6 +1118,10 @@ def main():
                 1,
             )
         )
+
+        # =================================================================
+        # Validation
+        # =================================================================
 
         val_dice = evaluate(
             model,
@@ -908,9 +1144,10 @@ def main():
             f"LR: {current_lr:.2e}"
         )
 
-        # =========================================================
+        # =================================================================
         # Save best checkpoint
-        # =========================================================
+        # =================================================================
+
         if val_dice > best_val_dice:
 
             best_val_dice = (
@@ -942,6 +1179,10 @@ def main():
                 f"{checkpoint_path}"
             )
 
+    # =================================================================
+    # Training complete
+    # =================================================================
+
     print(
         "\nTraining complete."
     )
@@ -951,6 +1192,10 @@ def main():
         f"{best_val_dice:.4f}"
     )
 
+
+# =====================================================================
+# Entry point
+# =====================================================================
 
 if __name__ == "__main__":
     main()
