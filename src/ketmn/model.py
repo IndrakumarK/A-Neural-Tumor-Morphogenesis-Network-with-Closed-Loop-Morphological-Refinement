@@ -1,3 +1,36 @@
+"""
+NTMN: Neural Tumor Morphogenesis Network.
+
+Closed-loop morphology-conditioned recurrent refinement for
+multimodal brain tumor segmentation in 2-D MRI.
+
+The central mechanism is:
+
+    intermediate prediction
+        ↓
+    prediction-derived morphology
+        ↓
+    learned morphological representation
+        ↓
+    morphological discrepancy
+        ↓
+    instance-specific structural correction
+        ↓
+    recurrent refinement
+
+Input:
+    T1, T1ce, T2, FLAIR
+
+Input resolution:
+    256 × 256
+
+Segmentation classes:
+    0 = Background
+    1 = NCR/NET
+    2 = Edema
+    3 = Enhancing Tumor
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,13 +40,19 @@ from .topology import soft_euler_characteristic
 from .uncertainty import normalized_predictive_entropy
 
 
-# ---------------------------------------------------------------------
+# =====================================================================
 # ConvGRU
-# ---------------------------------------------------------------------
+# =====================================================================
+
 class ConvGRU(nn.Module):
-  
+    """
+    Convolutional GRU for recurrent spatial structural-state refinement.
+    """
+
     def __init__(self, channels):
         super().__init__()
+
+        self.channels = channels
 
         self.update_gate = nn.Conv2d(
             2 * channels,
@@ -71,15 +110,23 @@ class ConvGRU(nn.Module):
         return hidden
 
 
-# ---------------------------------------------------------------------
+# =====================================================================
 # MBNSS
-# ---------------------------------------------------------------------
+# =====================================================================
+
 class MBNSS(nn.Module):
-   
+    """
+    Morphology- and Boundary-Normal-Aware Skull Stripping.
+
+    Produces a soft brain probability map used to restrict the
+    multimodal MRI input before anatomical encoding.
+    """
+
     def __init__(self):
         super().__init__()
 
         self.net = nn.Sequential(
+
             nn.Conv2d(
                 4,
                 32,
@@ -109,16 +156,27 @@ class MBNSS(nn.Module):
             self.net(x)
         )
 
-# ---------------------------------------------------------------------
+
+# =====================================================================
 # Anatomical / Spatial Enhancement
-# ---------------------------------------------------------------------
+# =====================================================================
+
 class ASE(nn.Module):
- 
-    def __init__(self):
+    """
+    Multimodal anatomical/spatial encoder.
+
+    The encoder produces a 256-channel anatomical representation
+    from the four MRI modalities.
+    """
+
+    def __init__(
+        self,
+        structural_dim=256,
+        num_heads=8,
+    ):
         super().__init__()
 
-        self.net = nn.Sequential(
-
+        self.conv1 = nn.Sequential(
             nn.Conv2d(
                 4,
                 64,
@@ -127,7 +185,9 @@ class ASE(nn.Module):
             ),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
+        )
 
+        self.conv2 = nn.Sequential(
             nn.Conv2d(
                 64,
                 128,
@@ -137,35 +197,126 @@ class ASE(nn.Module):
             ),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
+        )
 
+        self.conv3 = nn.Sequential(
             nn.Conv2d(
                 128,
-                256,
+                structural_dim,
                 kernel_size=3,
                 stride=2,
                 padding=1,
             ),
-            nn.BatchNorm2d(256),
+            nn.BatchNorm2d(structural_dim),
             nn.ReLU(inplace=True),
         )
 
-    def forward(self, x):
-        return self.net(x)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=structural_dim,
+            num_heads=num_heads,
+            batch_first=True,
+        )
 
-# ---------------------------------------------------------------------
-# Morphological Knowledge Encoder
-# ---------------------------------------------------------------------
+        self.norm1 = nn.LayerNorm(
+            structural_dim
+        )
+
+        self.mlp = nn.Sequential(
+            nn.Linear(
+                structural_dim,
+                structural_dim * 2,
+            ),
+            nn.GELU(),
+
+            nn.Linear(
+                structural_dim * 2,
+                structural_dim,
+            ),
+        )
+
+        self.norm2 = nn.LayerNorm(
+            structural_dim
+        )
+
+    def forward(self, x):
+
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.conv3(x)
+
+        batch_size, channels, height, width = (
+            x.shape
+        )
+
+        tokens = x.flatten(
+            2
+        ).transpose(
+            1,
+            2,
+        )
+
+        attended, _ = self.attention(
+            tokens,
+            tokens,
+            tokens,
+            need_weights=False,
+        )
+
+        tokens = self.norm1(
+            tokens + attended
+        )
+
+        tokens = self.norm2(
+            tokens + self.mlp(tokens)
+        )
+
+        x = tokens.transpose(
+            1,
+            2,
+        ).reshape(
+            batch_size,
+            channels,
+            height,
+            width,
+        )
+
+        return x
+
+
+# =====================================================================
+# Learned Morphological Representation
+# =====================================================================
+
 class MorphologicalKnowledgeEncoder(nn.Module):
-   
+    """
+    Learns the expected morphological representation directly
+    from the recurrent structural state.
+
+    This is intentionally separate from the prediction-derived
+    morphology extractor.
+
+    Input:
+        recurrent structural state [B, 256, H, W]
+
+    Output:
+        learned morphology representation [B, morphology_dim]
+    """
+
     def __init__(
         self,
+        structural_dim=256,
         morphology_dim=9,
     ):
         super().__init__()
 
+        self.pool = nn.AdaptiveAvgPool2d(
+            output_size=1
+        )
+
         self.encoder = nn.Sequential(
+
             nn.Linear(
-                morphology_dim,
+                structural_dim,
                 128,
             ),
             nn.ReLU(inplace=True),
@@ -176,28 +327,37 @@ class MorphologicalKnowledgeEncoder(nn.Module):
             ),
         )
 
-    def forward(self, morphology_features):
+    def forward(self, structural_state):
 
-        return self.encoder(
-            morphology_features
+        pooled = self.pool(
+            structural_state
+        ).flatten(
+            1
         )
 
-# ---------------------------------------------------------------------
+        return self.encoder(
+            pooled
+        )
+
+
+# =====================================================================
 # Knowledge Discrepancy Projection
-# ---------------------------------------------------------------------
+# =====================================================================
+
 class KnowledgeDiscrepancyProjection(nn.Module):
     """
-    Converts morphology discrepancy into a structural correction.
+    Projects morphology discrepancy into the structural feature space.
     """
 
     def __init__(
         self,
-        morphology_dim,
-        structural_dim,
+        morphology_dim=9,
+        structural_dim=256,
     ):
         super().__init__()
 
         self.projection = nn.Sequential(
+
             nn.Linear(
                 morphology_dim,
                 structural_dim,
@@ -216,18 +376,126 @@ class KnowledgeDiscrepancyProjection(nn.Module):
             discrepancy
         )
 
-# ---------------------------------------------------------------------
-# Topology-aware transformation
-# ---------------------------------------------------------------------
-class TopologyRefinement(nn.Module):
-  
+
+# =====================================================================
+# Morphology-Conditioned Feedback
+# =====================================================================
+
+class MorphologyFeedback(nn.Module):
+    """
+    Converts morphology discrepancy into an instance-specific
+    residual structural correction.
+
+    The discrepancy first generates a structural conditioning
+    vector. This vector modulates the current recurrent state,
+    after which a convolutional correction is generated.
+
+    Formulation:
+
+        q_t^K = MLP_K(D_t^K)
+
+        F_t^K =
+            Sbar_t ⊙ (1 + Broadcast(q_t^K))
+
+        Delta S_t^K =
+            Conv_K(F_t^K)
+
+        S_t =
+            Sbar_t + Delta S_t^K
+    """
+
     def __init__(
         self,
-        structural_dim,
+        morphology_dim=9,
+        structural_dim=256,
+    ):
+        super().__init__()
+
+        self.discrepancy_projection = (
+            KnowledgeDiscrepancyProjection(
+                morphology_dim=morphology_dim,
+                structural_dim=structural_dim,
+            )
+        )
+
+        self.correction = nn.Sequential(
+
+            nn.Conv2d(
+                structural_dim,
+                structural_dim,
+                kernel_size=3,
+                padding=1,
+            ),
+            nn.BatchNorm2d(
+                structural_dim
+            ),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(
+                structural_dim,
+                structural_dim,
+                kernel_size=3,
+                padding=1,
+            ),
+        )
+
+    def forward(
+        self,
+        structural_state,
+        discrepancy,
+    ):
+
+        conditioning = (
+            self.discrepancy_projection(
+                discrepancy
+            )
+        )
+
+        conditioning = (
+            conditioning
+            .unsqueeze(-1)
+            .unsqueeze(-1)
+        )
+
+        feedback_state = (
+            structural_state
+            * (1.0 + conditioning)
+        )
+
+        correction = self.correction(
+            feedback_state
+        )
+
+        refined_state = (
+            structural_state
+            + correction
+        )
+
+        return (
+            refined_state,
+            conditioning,
+            correction,
+        )
+
+
+# =====================================================================
+# Topology-Aware Refinement
+# =====================================================================
+
+class TopologyRefinement(nn.Module):
+    """
+    Structural refinement using a differentiable soft Euler
+    characteristic of the foreground prediction.
+    """
+
+    def __init__(
+        self,
+        structural_dim=256,
     ):
         super().__init__()
 
         self.feature_transform = nn.Sequential(
+
             nn.Conv2d(
                 structural_dim,
                 structural_dim,
@@ -241,6 +509,7 @@ class TopologyRefinement(nn.Module):
         )
 
         self.topology_projection = nn.Sequential(
+
             nn.Linear(
                 1,
                 structural_dim,
@@ -259,21 +528,23 @@ class TopologyRefinement(nn.Module):
         foreground_probability,
     ):
 
-        transformed = self.feature_transform(
-            structural_state
+        transformed = (
+            self.feature_transform(
+                structural_state
+            )
         )
 
-        # Soft Euler characteristic.
         chi = soft_euler_characteristic(
             foreground_probability
         )
 
-        # Ensure shape [B, 1].
         if chi.ndim == 1:
             chi = chi.unsqueeze(1)
 
         topology_embedding = (
-            self.topology_projection(chi)
+            self.topology_projection(
+                chi
+            )
         )
 
         topology_embedding = (
@@ -289,18 +560,24 @@ class TopologyRefinement(nn.Module):
 
         return refined_state
 
-# ---------------------------------------------------------------------
-# Connectivity refinement
-# ---------------------------------------------------------------------
+
+# =====================================================================
+# Connectivity Refinement
+# =====================================================================
+
 class ConnectivityRefinement(nn.Module):
-   
+    """
+    Local 8-neighbour connectivity refinement.
+    """
+
     def __init__(
         self,
-        structural_dim,
+        structural_dim=256,
     ):
         super().__init__()
 
         self.refinement = nn.Sequential(
+
             nn.Conv2d(
                 structural_dim,
                 structural_dim,
@@ -314,6 +591,7 @@ class ConnectivityRefinement(nn.Module):
         )
 
         self.connectivity_gate = nn.Sequential(
+
             nn.Conv2d(
                 1,
                 structural_dim,
@@ -329,7 +607,6 @@ class ConnectivityRefinement(nn.Module):
         foreground_probability,
     ):
 
-        # 8-neighbour local connectivity approximation.
         shifts = [
             (-1, -1),
             (-1, 0),
@@ -355,11 +632,13 @@ class ConnectivityRefinement(nn.Module):
 
             connectivity = (
                 connectivity
-                + foreground_probability * shifted
+                + foreground_probability
+                * shifted
             )
 
         connectivity = (
-            connectivity / len(shifts)
+            connectivity
+            / len(shifts)
         )
 
         gate = self.connectivity_gate(
@@ -375,18 +654,28 @@ class ConnectivityRefinement(nn.Module):
             + gate * refined
         )
 
-# ---------------------------------------------------------------------
-# Uncertainty-guided refinement
-# ---------------------------------------------------------------------
+
+# =====================================================================
+# Uncertainty-Guided Refinement
+# =====================================================================
+
 class UncertaintyRefinement(nn.Module):
-    
+    """
+    Uncertainty-guided structural refinement.
+
+    Normalized predictive entropy is combined with the final
+    morphology discrepancy to generate an instance-specific
+    refinement gate.
+    """
+
     def __init__(
         self,
-        structural_dim,
+        structural_dim=256,
     ):
         super().__init__()
 
         self.refinement = nn.Sequential(
+
             nn.Conv2d(
                 structural_dim,
                 structural_dim,
@@ -400,6 +689,7 @@ class UncertaintyRefinement(nn.Module):
         )
 
         self.uncertainty_gate = nn.Sequential(
+
             nn.Conv2d(
                 1,
                 structural_dim,
@@ -416,29 +706,38 @@ class UncertaintyRefinement(nn.Module):
         morphology_discrepancy,
     ):
 
-        entropy = normalized_predictive_entropy(
-            auxiliary_probability
+        entropy = (
+            normalized_predictive_entropy(
+                auxiliary_probability
+            )
         )
 
-        # Convert morphology discrepancy to a spatial map.
-        discrepancy_map = (
-            morphology_discrepancy
-            .mean(
+        # -------------------------------------------------------------
+        # Scalar morphology-discrepancy magnitude
+        # -------------------------------------------------------------
+
+        discrepancy_magnitude = (
+            morphology_discrepancy.abs().mean(
                 dim=1,
                 keepdim=True,
             )
-            .unsqueeze(-1)
-            .unsqueeze(-1)
         )
 
         discrepancy_map = (
-            discrepancy_map.expand(
+            discrepancy_magnitude
+            .unsqueeze(-1)
+            .unsqueeze(-1)
+            .expand(
                 -1,
                 -1,
                 structural_state.shape[-2],
                 structural_state.shape[-1],
             )
         )
+
+        # -------------------------------------------------------------
+        # Combined uncertainty signal
+        # -------------------------------------------------------------
 
         uncertainty_map = (
             entropy
@@ -463,11 +762,18 @@ class UncertaintyRefinement(nn.Module):
             entropy,
         )
 
-# ---------------------------------------------------------------------
-# KE-NTMN
-# ---------------------------------------------------------------------
-class KE_NTMN(nn.Module):
-  
+
+# =====================================================================
+# NTMN
+# =====================================================================
+
+class NTMN(nn.Module):
+    """
+    Neural Tumor Morphogenesis Network.
+
+    Closed-loop morphology-conditioned recurrent refinement.
+    """
+
     def __init__(
         self,
         num_classes=4,
@@ -485,25 +791,32 @@ class KE_NTMN(nn.Module):
         # -------------------------------------------------------------
         # 1. MBNSS
         # -------------------------------------------------------------
+
         self.mbnss = MBNSS()
 
         # -------------------------------------------------------------
-        # 2. ASE
+        # 2. Anatomical / Spatial Encoder
         # -------------------------------------------------------------
-        self.ase = ASE()
+
+        self.ase = ASE(
+            structural_dim=structural_dim,
+            num_heads=8,
+        )
 
         # -------------------------------------------------------------
-        # 3. Initial structural representation
+        # 3. Initial structural projection
         # -------------------------------------------------------------
+
         self.initial_projection = nn.Conv2d(
-            256,
+            structural_dim,
             structural_dim,
             kernel_size=1,
         )
 
         # -------------------------------------------------------------
-        # 4. Recurrent structural-state evolution
+        # 4. ConvGRU recurrent structural evolution
         # -------------------------------------------------------------
+
         self.gru = ConvGRU(
             structural_dim
         )
@@ -511,6 +824,7 @@ class KE_NTMN(nn.Module):
         # -------------------------------------------------------------
         # 5. Intermediate segmentation head
         # -------------------------------------------------------------
+
         self.segmentation_head = nn.Conv2d(
             structural_dim,
             num_classes,
@@ -518,19 +832,22 @@ class KE_NTMN(nn.Module):
         )
 
         # -------------------------------------------------------------
-        # 6. Morphological knowledge
+        # 6. Learned morphological representation
         # -------------------------------------------------------------
+
         self.morphology_encoder = (
             MorphologicalKnowledgeEncoder(
-                morphology_dim=morphology_dim
+                structural_dim=structural_dim,
+                morphology_dim=morphology_dim,
             )
         )
 
         # -------------------------------------------------------------
-        # 7. Morphology discrepancy → structural correction
+        # 7. Morphology-conditioned feedback
         # -------------------------------------------------------------
-        self.feedback = (
-            KnowledgeDiscrepancyProjection(
+
+        self.morphology_feedback = (
+            MorphologyFeedback(
                 morphology_dim=morphology_dim,
                 structural_dim=structural_dim,
             )
@@ -539,6 +856,7 @@ class KE_NTMN(nn.Module):
         # -------------------------------------------------------------
         # 8. Topology refinement
         # -------------------------------------------------------------
+
         self.topology_refinement = (
             TopologyRefinement(
                 structural_dim=structural_dim
@@ -548,6 +866,7 @@ class KE_NTMN(nn.Module):
         # -------------------------------------------------------------
         # 9. Connectivity refinement
         # -------------------------------------------------------------
+
         self.connectivity_refinement = (
             ConnectivityRefinement(
                 structural_dim=structural_dim
@@ -557,6 +876,7 @@ class KE_NTMN(nn.Module):
         # -------------------------------------------------------------
         # 10. Auxiliary prediction branch
         # -------------------------------------------------------------
+
         self.auxiliary_head = nn.Conv2d(
             structural_dim,
             num_classes,
@@ -566,6 +886,7 @@ class KE_NTMN(nn.Module):
         # -------------------------------------------------------------
         # 11. Uncertainty-guided refinement
         # -------------------------------------------------------------
+
         self.uncertainty_refinement = (
             UncertaintyRefinement(
                 structural_dim=structural_dim
@@ -575,6 +896,7 @@ class KE_NTMN(nn.Module):
         # -------------------------------------------------------------
         # 12. Final decoder
         # -------------------------------------------------------------
+
         self.decoder = nn.Sequential(
 
             nn.Conv2d(
@@ -592,6 +914,10 @@ class KE_NTMN(nn.Module):
             ),
         )
 
+    # -----------------------------------------------------------------
+    # Forward
+    # -----------------------------------------------------------------
+
     def forward(
         self,
         x,
@@ -599,29 +925,38 @@ class KE_NTMN(nn.Module):
     ):
 
         # =============================================================
-        # MBNSS
+        # 1. MBNSS
         # =============================================================
-        brain_mask = self.mbnss(x)
+
+        brain_mask = self.mbnss(
+            x
+        )
 
         masked_input = (
             x * brain_mask
         )
 
         # =============================================================
-        # ASE
+        # 2. ASE
         # =============================================================
-        features = self.ase(
+
+        structural_state = self.ase(
             masked_input
         )
 
         # =============================================================
-        # Initial structural state
+        # 3. Initial structural state
         # =============================================================
+
         structural_state = (
             self.initial_projection(
-                features
+                structural_state
             )
         )
+
+        # ASE downsamples by a factor of four.
+        # Restore the structural state to the original
+        # image resolution before recurrent refinement.
 
         structural_state = F.interpolate(
             structural_state,
@@ -631,45 +966,58 @@ class KE_NTMN(nn.Module):
         )
 
         # =============================================================
-        # Recurrent morphological refinement
+        # 4. Recurrent morphology-conditioned refinement
         # =============================================================
+
         states = []
+
+        stage_logits = []
         stage_probs = []
+
         morphologies = []
-        expected_morphologies = []
+        learned_morphologies = []
         discrepancies = []
+
+        feedback_conditionings = []
+        feedback_corrections = []
 
         previous_state = None
 
         for _ in range(self.steps):
 
             # ---------------------------------------------------------
-            # ConvGRU structural-state update
+            # ConvGRU state evolution
             # ---------------------------------------------------------
-            structural_state = self.gru(
+
+            recurrent_state = self.gru(
                 structural_state,
                 previous_state,
             )
 
             # ---------------------------------------------------------
-            # Intermediate segmentation
+            # Intermediate segmentation prediction
             # ---------------------------------------------------------
-            stage_logits = (
+
+            logits_t = (
                 self.segmentation_head(
-                    structural_state
+                    recurrent_state
                 )
             )
 
-            stage_prob = torch.softmax(
-                stage_logits,
+            probability_t = torch.softmax(
+                logits_t,
                 dim=1,
             )
 
             # ---------------------------------------------------------
             # Foreground probability
+            #
+            # Combined tumor foreground is used for morphology
+            # feedback.
             # ---------------------------------------------------------
-            foreground = (
-                stage_prob[:, 1:]
+
+            foreground_t = (
+                probability_t[:, 1:]
                 .sum(
                     dim=1,
                     keepdim=True,
@@ -677,89 +1025,119 @@ class KE_NTMN(nn.Module):
             )
 
             # ---------------------------------------------------------
-            # Differentiable morphology extraction
+            # Prediction-derived morphology
+            #
+            # morphology() provides the six descriptor groups:
+            #
+            #   area
+            #   centroid
+            #   covariance
+            #   elongation
+            #   soft boundary
+            #   soft compactness
+            #
+            # with the corresponding scalar representation
+            # expected by morphology_dim=9.
             # ---------------------------------------------------------
+
             predicted_morphology = morphology(
-                foreground
+                foreground_t
             )
 
             # ---------------------------------------------------------
-            # Expected morphological knowledge
+            # Learned morphological expectation
+            #
+            # IMPORTANT:
+            # This is derived from the learned recurrent structural
+            # state, not from predicted_morphology itself.
             # ---------------------------------------------------------
-            expected_morphology = (
+
+            learned_morphology = (
                 self.morphology_encoder(
-                    predicted_morphology
+                    recurrent_state
                 )
             )
 
             # ---------------------------------------------------------
-            # Morphological knowledge discrepancy
+            # Morphological discrepancy
             # ---------------------------------------------------------
+
             discrepancy = (
-                predicted_morphology
-                - expected_morphology
-            )
-
-            discrepancy_score = (
-                discrepancy.abs().mean(
-                    dim=1,
-                    keepdim=True,
-                )
+                learned_morphology
+                - predicted_morphology
             )
 
             # ---------------------------------------------------------
-            # Knowledge-conditioned residual correction
+            # Closed-loop morphology feedback
             # ---------------------------------------------------------
-            residual = self.feedback(
-                discrepancy
-            )
 
-            residual = (
-                residual
-                .unsqueeze(-1)
-                .unsqueeze(-1)
-            )
-
-            structural_state = (
-                structural_state
-                + residual
+            (
+                refined_state,
+                feedback_conditioning,
+                feedback_correction,
+            ) = self.morphology_feedback(
+                recurrent_state,
+                discrepancy,
             )
 
             # ---------------------------------------------------------
-            # Store recurrent outputs
+            # Save stage outputs
             # ---------------------------------------------------------
+
             states.append(
-                structural_state
+                refined_state
+            )
+
+            stage_logits.append(
+                logits_t
             )
 
             stage_probs.append(
-                stage_prob
+                probability_t
             )
 
             morphologies.append(
                 predicted_morphology
             )
 
-            expected_morphologies.append(
-                expected_morphology
+            learned_morphologies.append(
+                learned_morphology
             )
 
             discrepancies.append(
-                discrepancy_score
+                discrepancy
+            )
+
+            feedback_conditionings.append(
+                feedback_conditioning
+            )
+
+            feedback_corrections.append(
+                feedback_correction
+            )
+
+            # ---------------------------------------------------------
+            # Corrected state becomes the input to the next recurrent
+            # refinement stage.
+            # ---------------------------------------------------------
+
+            structural_state = (
+                refined_state
             )
 
             previous_state = (
-                structural_state
+                refined_state
             )
 
         # =============================================================
-        # Topology refinement
+        # 5. Final intermediate prediction
         # =============================================================
+
         final_stage_probability = (
             stage_probs[-1]
         )
 
-        foreground = (
+        final_foreground = (
             final_stage_probability[:, 1:]
             .sum(
                 dim=1,
@@ -767,26 +1145,32 @@ class KE_NTMN(nn.Module):
             )
         )
 
+        # =============================================================
+        # 6. Topology refinement
+        # =============================================================
+
         structural_state = (
             self.topology_refinement(
                 structural_state,
-                foreground,
+                final_foreground,
             )
         )
 
         # =============================================================
-        # Connectivity refinement
+        # 7. Connectivity refinement
         # =============================================================
+
         structural_state = (
             self.connectivity_refinement(
                 structural_state,
-                foreground,
+                final_foreground,
             )
         )
 
         # =============================================================
-        # Auxiliary prediction for uncertainty estimation
+        # 8. Auxiliary prediction
         # =============================================================
+
         auxiliary_logits = (
             self.auxiliary_head(
                 structural_state
@@ -801,35 +1185,26 @@ class KE_NTMN(nn.Module):
         )
 
         # =============================================================
-        # Uncertainty-guided refinement
+        # 9. Uncertainty-guided refinement
         # =============================================================
-        final_discrepancy = (
+
+        final_morphology_discrepancy = (
             discrepancies[-1]
-            .expand(
-                -1,
-                -1,
-                structural_state.shape[-2],
-                structural_state.shape[-1],
-            )
         )
 
-        # Recover the descriptor-level discrepancy.
-        final_descriptor_discrepancy = (
-            morphologies[-1]
-            - expected_morphologies[-1]
-        )
-
-        structural_state, entropy = (
-            self.uncertainty_refinement(
-                structural_state,
-                auxiliary_probability,
-                final_descriptor_discrepancy,
-            )
+        (
+            structural_state,
+            predictive_entropy,
+        ) = self.uncertainty_refinement(
+            structural_state,
+            auxiliary_probability,
+            final_morphology_discrepancy,
         )
 
         # =============================================================
-        # Final decoder
+        # 10. Final decoder
         # =============================================================
+
         logits = self.decoder(
             structural_state
         )
@@ -840,57 +1215,134 @@ class KE_NTMN(nn.Module):
         )
 
         # =============================================================
-        # Knowledge discrepancy tensor
+        # 11. Scalar discrepancy magnitude for reporting
         # =============================================================
-        knowledge_discrepancy = torch.stack(
-            discrepancies,
-            dim=1,
-        ).squeeze(-1)
+
+        discrepancy_magnitude = (
+            final_morphology_discrepancy
+            .abs()
+            .sum(
+                dim=1,
+            )
+        )
 
         # =============================================================
-        # Return all quantities required by training/evaluation
+        # 12. Return
         # =============================================================
+
         return {
-            # Final prediction
-            "prob": probabilities,
+
+            # ---------------------------------------------------------
+            # Final segmentation
+            # ---------------------------------------------------------
+
             "logits": logits,
 
+            "prob": probabilities,
+
+            # ---------------------------------------------------------
             # MBNSS
+            # ---------------------------------------------------------
+
             "brain_mask": brain_mask,
 
-            # Recurrent states
+            # ---------------------------------------------------------
+            # Recurrent structural states
+            # ---------------------------------------------------------
+
             "states": states,
 
-            # Stage-wise segmentation
+            # ---------------------------------------------------------
+            # Intermediate segmentation predictions
+            # ---------------------------------------------------------
+
+            "stage_logits": stage_logits,
+
             "stage_probs": stage_probs,
 
-            # Morphological representations
+            # ---------------------------------------------------------
+            # Prediction-derived morphology
+            # ---------------------------------------------------------
+
             "morphology": morphologies[-1],
+
             "morphologies": morphologies,
 
-            # Expected morphology
+            # ---------------------------------------------------------
+            # Learned morphology
+            # ---------------------------------------------------------
+
             "expected_morphology": (
-                expected_morphologies[-1]
+                learned_morphologies[-1]
             ),
 
             "expected_morphologies": (
-                expected_morphologies
+                learned_morphologies
             ),
 
-            # Morphology discrepancy
+            # ---------------------------------------------------------
+            # Vector-valued morphology discrepancy
+            # ---------------------------------------------------------
+
             "knowledge_discrepancy": (
-                knowledge_discrepancy
+                torch.stack(
+                    discrepancies,
+                    dim=1,
+                )
             ),
 
             "descriptor_discrepancy": (
-                final_descriptor_discrepancy
+                final_morphology_discrepancy
             ),
 
-            # Topology / connectivity representation
-            "topology_state": structural_state,
+            # ---------------------------------------------------------
+            # Scalar morphology discrepancy magnitude
+            # ---------------------------------------------------------
 
+            "morphology_discrepancy": (
+                discrepancy_magnitude
+            ),
+
+            # ---------------------------------------------------------
+            # Feedback information
+            # ---------------------------------------------------------
+
+            "feedback_conditionings": (
+                feedback_conditionings
+            ),
+
+            "feedback_corrections": (
+                feedback_corrections
+            ),
+
+            # ---------------------------------------------------------
+            # Final structural state
+            # ---------------------------------------------------------
+
+            "final_structural_state": (
+                structural_state
+            ),
+
+            # ---------------------------------------------------------
             # Auxiliary uncertainty branch
-            "auxiliary_logits": auxiliary_logits,
-            "auxiliary_prob": auxiliary_probability,
-            "uncertainty": entropy,
+            # ---------------------------------------------------------
+
+            "auxiliary_logits": (
+                auxiliary_logits
+            ),
+
+            "auxiliary_prob": (
+                auxiliary_probability
+            ),
+
+            "uncertainty": (
+                predictive_entropy
+            ),
         }
+
+
+# =====================================================================
+# Backward-compatible alias
+# =====================================================================
+
+KE_NTMN = NTMN
