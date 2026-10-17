@@ -1,3 +1,10 @@
+"""
+NTMN: Neural Tumor Morphogenesis Network.
+
+Research-oriented dataset implementation for multimodal brain tumor
+MRI segmentation.
+"""
+
 from pathlib import Path
 
 import numpy as np
@@ -57,6 +64,13 @@ class BrainTumorDataset(Dataset):
         "FLAIR",
     )
 
+    # Dataset-specific availability of the four-class output space.
+    #
+    # Class order:
+    #   0 = Background
+    #   1 = NCR/NET
+    #   2 = Edema
+    #   3 = Enhancing Tumor
     DATASET_VALID_CLASSES = {
         "UPenn": (
             True,
@@ -121,9 +135,10 @@ class BrainTumorDataset(Dataset):
         # -------------------------------------------------------------
         # Basic configuration checks
         # -------------------------------------------------------------
+
         if self.num_classes != 4:
             raise ValueError(
-                "KE-NTMN expects four segmentation classes: "
+                "NTMN expects four segmentation classes: "
                 "Background, NCR/NET, ED, and ET."
             )
 
@@ -158,6 +173,7 @@ class BrainTumorDataset(Dataset):
         # -------------------------------------------------------------
         # Dataset directory
         # -------------------------------------------------------------
+
         if not self.root.exists():
             raise FileNotFoundError(
                 f"Dataset directory does not exist: "
@@ -188,6 +204,7 @@ class BrainTumorDataset(Dataset):
     # -----------------------------------------------------------------
     # Case loading
     # -----------------------------------------------------------------
+
     def _load_case(self, case_dir):
         """
         Load four MRI modalities, segmentation mask,
@@ -199,6 +216,7 @@ class BrainTumorDataset(Dataset):
         # -------------------------------------------------------------
         # MRI modalities
         # -------------------------------------------------------------
+
         for modality in self.MODALITIES:
 
             path = case_dir / f"{modality}.npy"
@@ -223,6 +241,7 @@ class BrainTumorDataset(Dataset):
         # -------------------------------------------------------------
         # Segmentation mask
         # -------------------------------------------------------------
+
         mask_path = case_dir / "mask.npy"
 
         if not mask_path.exists():
@@ -242,6 +261,7 @@ class BrainTumorDataset(Dataset):
         # -------------------------------------------------------------
         # Physical pixel spacing
         # -------------------------------------------------------------
+
         spacing_path = case_dir / "spacing.npy"
 
         if not spacing_path.exists():
@@ -284,6 +304,7 @@ class BrainTumorDataset(Dataset):
         # -------------------------------------------------------------
         # Spatial consistency
         # -------------------------------------------------------------
+
         image_shape = images[0].shape
 
         for modality, image in zip(
@@ -314,8 +335,13 @@ class BrainTumorDataset(Dataset):
     # -----------------------------------------------------------------
     # Normalization
     # -----------------------------------------------------------------
+
     @staticmethod
     def _zscore(image):
+        """
+        Apply per-image z-score normalization.
+        """
+
         mean = image.mean()
         std = image.std()
 
@@ -325,6 +351,10 @@ class BrainTumorDataset(Dataset):
         return (image - mean) / std
 
     def _normalize(self, images):
+        """
+        Apply z-score normalization independently
+        to each MRI modality.
+        """
 
         normalized = np.empty_like(
             images,
@@ -345,6 +375,7 @@ class BrainTumorDataset(Dataset):
     # -----------------------------------------------------------------
     # 2-D affine augmentation
     # -----------------------------------------------------------------
+
     @staticmethod
     def _affine_transform_2d(
         array,
@@ -354,6 +385,13 @@ class BrainTumorDataset(Dataset):
         mode,
         cval,
     ):
+        """
+        Apply centered 2-D rotation and scaling.
+
+        scipy.ndimage.affine_transform expects
+        an inverse coordinate mapping.
+        """
+
         height, width = array.shape
 
         angle = np.deg2rad(
@@ -418,10 +456,15 @@ class BrainTumorDataset(Dataset):
         images,
         mask,
     ):
+        """
+        Apply synchronized spatial augmentation to
+        MRI modalities and segmentation mask.
+        """
 
         # -------------------------------------------------------------
         # Random horizontal flip
         # -------------------------------------------------------------
+
         if np.random.rand() < 0.5:
 
             images = np.flip(
@@ -437,6 +480,7 @@ class BrainTumorDataset(Dataset):
         # -------------------------------------------------------------
         # Random vertical flip
         # -------------------------------------------------------------
+
         if np.random.rand() < 0.5:
 
             images = np.flip(
@@ -452,6 +496,7 @@ class BrainTumorDataset(Dataset):
         # -------------------------------------------------------------
         # Small-angle rotation
         # -------------------------------------------------------------
+
         if np.random.rand() < 0.5:
 
             angle = np.random.uniform(
@@ -478,6 +523,8 @@ class BrainTumorDataset(Dataset):
                     cval=0.0,
                 )
 
+            # Nearest-neighbor interpolation
+            # preserves discrete segmentation labels.
             mask = self._affine_transform_2d(
                 mask,
                 angle_degrees=angle,
@@ -492,6 +539,7 @@ class BrainTumorDataset(Dataset):
         # -------------------------------------------------------------
         # Random scaling
         # -------------------------------------------------------------
+
         if np.random.rand() < 0.5:
 
             scale = np.random.uniform(
@@ -518,6 +566,8 @@ class BrainTumorDataset(Dataset):
                     cval=0.0,
                 )
 
+            # Nearest-neighbor interpolation
+            # preserves discrete segmentation labels.
             mask = self._affine_transform_2d(
                 mask,
                 angle_degrees=0.0,
@@ -534,11 +584,16 @@ class BrainTumorDataset(Dataset):
     # -----------------------------------------------------------------
     # Mask validation
     # -----------------------------------------------------------------
+
     def _validate_mask(
         self,
         mask,
         mask_path,
     ):
+        """
+        Validate segmentation labels and enforce the
+        dataset-specific MOTUM edema constraint.
+        """
 
         unique_labels = np.unique(mask)
 
@@ -570,6 +625,7 @@ class BrainTumorDataset(Dataset):
     # -----------------------------------------------------------------
     # Dataset item
     # -----------------------------------------------------------------
+
     def __getitem__(self, index):
 
         case_dir = self.cases[index]
@@ -585,6 +641,7 @@ class BrainTumorDataset(Dataset):
         # -------------------------------------------------------------
         # Per-modality z-score normalization
         # -------------------------------------------------------------
+
         images = self._normalize(
             images
         )
@@ -592,6 +649,7 @@ class BrainTumorDataset(Dataset):
         # -------------------------------------------------------------
         # Training augmentation
         # -------------------------------------------------------------
+
         if self.augment:
 
             images, mask = self._augment(
@@ -602,6 +660,7 @@ class BrainTumorDataset(Dataset):
         # -------------------------------------------------------------
         # Input-size validation
         # -------------------------------------------------------------
+
         if images.shape[1:] != self.image_size:
 
             raise ValueError(
@@ -617,6 +676,7 @@ class BrainTumorDataset(Dataset):
         # -------------------------------------------------------------
         # Mask validation
         # -------------------------------------------------------------
+
         mask = mask.astype(
             np.int64
         )
@@ -633,6 +693,7 @@ class BrainTumorDataset(Dataset):
         # -------------------------------------------------------------
         # Dataset-specific valid classes
         # -------------------------------------------------------------
+
         valid_classes = torch.tensor(
             self.DATASET_VALID_CLASSES[
                 self.dataset_name
@@ -643,6 +704,7 @@ class BrainTumorDataset(Dataset):
         # -------------------------------------------------------------
         # Convert to tensors
         # -------------------------------------------------------------
+
         images = torch.from_numpy(
             images.astype(
                 np.float32
