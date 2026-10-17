@@ -1,9 +1,48 @@
-"""
-NTMN: Neural Tumor Morphogenesis Network.
 
-Research-oriented dataset implementation for multimodal brain tumor
-MRI segmentation.
+Required files per slice
+------------------------
+
+T1.npy
+T1ce.npy
+T2.npy
+FLAIR.npy
+mask.npy
+spacing.npy
+
+Optional but required for supervised MBNSS training
+---------------------------------------------------
+
+brain_mask.npy
+
+The segmentation mask uses the four-class output space:
+
+    0 = Background
+    1 = NCR/NET
+    2 = Edema
+    3 = Enhancing Tumor
+
+Dataset-specific class availability:
+
+    UPenn-GBM : [True, True, True, True]
+    TCGA-GBM  : [True, True, True, True]
+    MOTUM     : [True, True, False, True]
+
+The class mapping above must correspond to the actual preprocessing
+label mapping used to construct mask.npy. This loader does not
+silently remap labels.
+
+Pixel spacing
+-------------
+
+spacing.npy must contain:
+
+    [row_spacing_mm, column_spacing_mm]
+
+and must correspond to the final 2-D image/mask arrays stored in
+the slice directory.
 """
+
+from __future__ import annotations
 
 from pathlib import Path
 
@@ -15,46 +54,20 @@ try:
     from scipy.ndimage import affine_transform
 except ImportError as exc:
     raise ImportError(
-        "scipy is required for small-angle rotation and random scaling. "
+        "SciPy is required for rotation and scaling augmentation. "
         "Install it with: pip install scipy"
     ) from exc
 
 
 class BrainTumorDataset(Dataset):
     """
-    Patient/case-level 2-D multimodal MRI dataset.
+    Patient- and slice-aware 2-D multimodal MRI dataset.
 
-    Expected directory structure
-    ----------------------------
-    root/
-        case_001/
-            T1.npy
-            T1ce.npy
-            T2.npy
-            FLAIR.npy
-            mask.npy
-            spacing.npy
-        case_002/
-            T1.npy
-            T1ce.npy
-            T2.npy
-            FLAIR.npy
-            mask.npy
-            spacing.npy
-        ...
+    Each Dataset item corresponds to ONE 2-D MRI slice.
 
-    spacing.npy must contain:
-        [row_spacing_mm, column_spacing_mm]
-
-    The spacing must correspond to the final image/mask arrays stored
-    in the .npy files.
-
-    Class order
-    -----------
-    0 = Background
-    1 = NCR/NET
-    2 = Edema
-    3 = Enhancing Tumor
+    Patient identity is preserved separately through `patient_id`,
+    allowing downstream evaluation code to aggregate predictions
+    across slices belonging to the same patient.
     """
 
     MODALITIES = (
@@ -64,13 +77,26 @@ class BrainTumorDataset(Dataset):
         "FLAIR",
     )
 
-    # Dataset-specific availability of the four-class output space.
-    #
-    # Class order:
-    #   0 = Background
-    #   1 = NCR/NET
-    #   2 = Edema
-    #   3 = Enhancing Tumor
+    # ------------------------------------------------------------------
+    # Four-class segmentation space
+    # ------------------------------------------------------------------
+
+    NUM_CLASSES = 4
+
+    # IMPORTANT:
+    # These labels must already have been created during preprocessing.
+    # This loader intentionally performs NO automatic semantic remapping.
+    CLASS_NAMES = {
+        0: "Background",
+        1: "NCR/NET",
+        2: "Edema",
+        3: "Enhancing Tumor",
+    }
+
+    # ------------------------------------------------------------------
+    # Dataset-specific class availability
+    # ------------------------------------------------------------------
+
     DATASET_VALID_CLASSES = {
         "UPenn": (
             True,
@@ -104,6 +130,10 @@ class BrainTumorDataset(Dataset):
         ),
     }
 
+    # ------------------------------------------------------------------
+    # Constructor
+    # ------------------------------------------------------------------
+
     def __init__(
         self,
         root,
@@ -113,46 +143,63 @@ class BrainTumorDataset(Dataset):
         dataset_name="UPenn-GBM",
         rotation_degrees=10.0,
         scale_range=(0.90, 1.10),
+        require_brain_mask=False,
     ):
+        super().__init__()
+
         self.root = Path(root)
 
         self.image_size = tuple(
-            int(x) for x in image_size
+            int(x)
+            for x in image_size
         )
 
-        self.num_classes = int(num_classes)
-        self.augment = bool(augment)
-        self.dataset_name = str(dataset_name)
+        self.num_classes = int(
+            num_classes
+        )
+
+        self.augment = bool(
+            augment
+        )
+
+        self.dataset_name = str(
+            dataset_name
+        )
 
         self.rotation_degrees = float(
             rotation_degrees
         )
 
         self.scale_range = tuple(
-            float(x) for x in scale_range
+            float(x)
+            for x in scale_range
         )
 
-        # -------------------------------------------------------------
-        # Basic configuration checks
-        # -------------------------------------------------------------
+        self.require_brain_mask = bool(
+            require_brain_mask
+        )
 
-        if self.num_classes != 4:
+        # --------------------------------------------------------------
+        # Configuration validation
+        # --------------------------------------------------------------
+
+        if self.num_classes != self.NUM_CLASSES:
             raise ValueError(
-                "NTMN expects four segmentation classes: "
-                "Background, NCR/NET, ED, and ET."
+                "NTMN currently expects exactly four segmentation "
+                "classes: Background, NCR/NET, Edema, and Enhancing Tumor."
             )
 
         if self.dataset_name not in self.DATASET_VALID_CLASSES:
             raise ValueError(
                 f"Unsupported dataset '{self.dataset_name}'. "
-                f"Expected one of: "
-                f"{list(self.DATASET_VALID_CLASSES.keys())}"
+                f"Expected one of "
+                f"{list(self.DATASET_VALID_CLASSES.keys())}."
             )
 
         if len(self.image_size) != 2:
             raise ValueError(
-                f"image_size must contain two values, "
-                f"got {self.image_size}"
+                f"image_size must contain exactly two values, "
+                f"got {self.image_size}."
             )
 
         if self.rotation_degrees < 0:
@@ -164,146 +211,259 @@ class BrainTumorDataset(Dataset):
             len(self.scale_range) != 2
             or self.scale_range[0] <= 0
             or self.scale_range[1] <= 0
-            or self.scale_range[0] > self.scale_range[1]
+            or self.scale_range[0]
+            > self.scale_range[1]
         ):
             raise ValueError(
                 f"Invalid scale_range: {self.scale_range}"
             )
 
-        # -------------------------------------------------------------
-        # Dataset directory
-        # -------------------------------------------------------------
+        # --------------------------------------------------------------
+        # Root directory
+        # --------------------------------------------------------------
 
         if not self.root.exists():
             raise FileNotFoundError(
-                f"Dataset directory does not exist: "
-                f"{self.root}"
+                f"Dataset directory does not exist: {self.root}"
             )
 
         if not self.root.is_dir():
             raise NotADirectoryError(
-                f"Dataset root is not a directory: "
+                f"Dataset root is not a directory: {self.root}"
+            )
+
+        # --------------------------------------------------------------
+        # Discover patient/slice samples
+        # --------------------------------------------------------------
+
+        self.samples = self._discover_samples()
+
+        if not self.samples:
+            raise RuntimeError(
+                f"No valid patient/slice samples were found under "
                 f"{self.root}"
             )
 
-        self.cases = sorted(
-            case_dir
-            for case_dir in self.root.iterdir()
-            if case_dir.is_dir()
+    # ==================================================================
+    # Sample discovery
+    # ==================================================================
+
+    def _discover_samples(self):
+        """
+        Discover samples using:
+
+            root/
+                patient_id/
+                    slice_id/
+                        T1.npy
+                        ...
+
+        Returns
+        -------
+        list of dict
+            One dictionary per 2-D slice.
+        """
+
+        samples = []
+
+        patient_dirs = sorted(
+            path
+            for path in self.root.iterdir()
+            if path.is_dir()
         )
 
-        if not self.cases:
-            raise RuntimeError(
-                f"No case directories found in: "
-                f"{self.root}"
+        for patient_dir in patient_dirs:
+
+            patient_id = patient_dir.name
+
+            slice_dirs = sorted(
+                path
+                for path in patient_dir.iterdir()
+                if path.is_dir()
             )
 
+            for slice_dir in slice_dirs:
+
+                slice_id = slice_dir.name
+
+                samples.append(
+                    {
+                        "patient_id": patient_id,
+                        "slice_id": slice_id,
+                        "case_id": (
+                            f"{patient_id}_{slice_id}"
+                        ),
+                        "path": slice_dir,
+                    }
+                )
+
+        return samples
+
+    # ==================================================================
+    # Dataset length
+    # ==================================================================
+
     def __len__(self):
-        return len(self.cases)
-
-    # -----------------------------------------------------------------
-    # Case loading
-    # -----------------------------------------------------------------
-
-    def _load_case(self, case_dir):
         """
-        Load four MRI modalities, segmentation mask,
-        and physical in-plane pixel spacing.
+        Number of 2-D slices.
         """
+
+        return len(
+            self.samples
+        )
+
+    # ==================================================================
+    # Case/slice loading
+    # ==================================================================
+
+    def _load_sample(
+        self,
+        sample,
+    ):
+        """
+        Load the four MRI modalities, segmentation mask,
+        optional brain mask, and physical pixel spacing.
+        """
+
+        slice_dir = sample["path"]
 
         images = []
 
-        # -------------------------------------------------------------
+        # --------------------------------------------------------------
         # MRI modalities
-        # -------------------------------------------------------------
+        # --------------------------------------------------------------
 
         for modality in self.MODALITIES:
 
-            path = case_dir / f"{modality}.npy"
+            path = (
+                slice_dir
+                / f"{modality}.npy"
+            )
 
             if not path.exists():
                 raise FileNotFoundError(
                     f"Missing modality file: {path}"
                 )
 
-            image = np.load(path).astype(
+            image = np.load(
+                path
+            ).astype(
                 np.float32
             )
 
             if image.ndim != 2:
                 raise ValueError(
                     f"{path} must contain a 2-D array, "
-                    f"got shape {image.shape}"
+                    f"got shape {image.shape}."
                 )
 
-            images.append(image)
+            images.append(
+                image
+            )
 
-        # -------------------------------------------------------------
+        # --------------------------------------------------------------
         # Segmentation mask
-        # -------------------------------------------------------------
+        # --------------------------------------------------------------
 
-        mask_path = case_dir / "mask.npy"
+        mask_path = (
+            slice_dir
+            / "mask.npy"
+        )
 
         if not mask_path.exists():
             raise FileNotFoundError(
-                f"Missing segmentation mask: "
-                f"{mask_path}"
+                f"Missing segmentation mask: {mask_path}"
             )
 
-        mask = np.load(mask_path)
+        mask = np.load(
+            mask_path
+        )
 
         if mask.ndim != 2:
             raise ValueError(
                 f"{mask_path} must contain a 2-D array, "
-                f"got shape {mask.shape}"
+                f"got shape {mask.shape}."
             )
 
-        # -------------------------------------------------------------
-        # Physical pixel spacing
-        # -------------------------------------------------------------
+        # --------------------------------------------------------------
+        # Brain mask
+        # --------------------------------------------------------------
 
-        spacing_path = case_dir / "spacing.npy"
+        brain_mask_path = (
+            slice_dir
+            / "brain_mask.npy"
+        )
+
+        brain_mask = None
+
+        if brain_mask_path.exists():
+
+            brain_mask = np.load(
+                brain_mask_path
+            )
+
+            if brain_mask.ndim != 2:
+                raise ValueError(
+                    f"{brain_mask_path} must contain a 2-D array, "
+                    f"got shape {brain_mask.shape}."
+                )
+
+        elif self.require_brain_mask:
+
+            raise FileNotFoundError(
+                f"MBNSS training requires brain_mask.npy, but it "
+                f"was not found in {slice_dir}."
+            )
+
+        # --------------------------------------------------------------
+        # Physical pixel spacing
+        # --------------------------------------------------------------
+
+        spacing_path = (
+            slice_dir
+            / "spacing.npy"
+        )
 
         if not spacing_path.exists():
             raise FileNotFoundError(
                 f"Missing physical pixel-spacing file: "
                 f"{spacing_path}\n"
-                f"Expected spacing.npy containing "
-                f"[row_spacing_mm, column_spacing_mm]."
+                f"Expected [row_spacing_mm, column_spacing_mm]."
             )
 
         pixel_spacing = np.asarray(
-            np.load(spacing_path),
-            dtype=np.float64,
+            np.load(
+                spacing_path
+            ),
+            dtype=np.float32,
         ).reshape(-1)
 
         if pixel_spacing.size != 2:
             raise ValueError(
-                f"{spacing_path} must contain exactly "
-                f"two values: "
+                f"{spacing_path} must contain exactly two values: "
                 f"[row_spacing_mm, column_spacing_mm]. "
-                f"Received shape {pixel_spacing.shape}."
+                f"Received {pixel_spacing.tolist()}."
             )
 
         if not np.all(
             np.isfinite(pixel_spacing)
         ):
             raise ValueError(
-                f"{spacing_path} contains non-finite "
-                f"pixel-spacing values: "
-                f"{pixel_spacing.tolist()}"
+                f"{spacing_path} contains non-finite values: "
+                f"{pixel_spacing.tolist()}."
             )
 
-        if np.any(pixel_spacing <= 0):
+        if np.any(
+            pixel_spacing <= 0
+        ):
             raise ValueError(
-                f"{spacing_path} contains invalid "
-                f"non-positive pixel spacing: "
-                f"{pixel_spacing.tolist()}"
+                f"{spacing_path} contains non-positive values: "
+                f"{pixel_spacing.tolist()}."
             )
 
-        # -------------------------------------------------------------
+        # --------------------------------------------------------------
         # Spatial consistency
-        # -------------------------------------------------------------
+        # --------------------------------------------------------------
 
         image_shape = images[0].shape
 
@@ -311,46 +471,83 @@ class BrainTumorDataset(Dataset):
             self.MODALITIES,
             images,
         ):
+
             if image.shape != image_shape:
+
                 raise ValueError(
-                    f"Spatial size mismatch in case "
-                    f"'{case_dir.name}': "
+                    f"Spatial mismatch in "
+                    f"{sample['case_id']}: "
                     f"{modality} has shape {image.shape}, "
                     f"expected {image_shape}."
                 )
 
         if mask.shape != image_shape:
+
             raise ValueError(
-                f"Mask shape {mask.shape} does not "
-                f"match image shape {image_shape} "
-                f"in case '{case_dir.name}'."
+                f"Mask shape {mask.shape} does not match "
+                f"image shape {image_shape} in "
+                f"{sample['case_id']}."
+            )
+
+        if (
+            brain_mask is not None
+            and brain_mask.shape != image_shape
+        ):
+
+            raise ValueError(
+                f"Brain mask shape {brain_mask.shape} does not "
+                f"match image shape {image_shape} in "
+                f"{sample['case_id']}."
             )
 
         return (
-            np.stack(images, axis=0),
+            np.stack(
+                images,
+                axis=0,
+            ),
             mask,
-            pixel_spacing.astype(np.float32),
+            brain_mask,
+            pixel_spacing,
         )
 
-    # -----------------------------------------------------------------
-    # Normalization
-    # -----------------------------------------------------------------
+    # ==================================================================
+    # Intensity normalization
+    # ==================================================================
 
     @staticmethod
-    def _zscore(image):
+    def _zscore(
+        image,
+    ):
         """
-        Apply per-image z-score normalization.
+        Per-slice, per-modality z-score normalization.
         """
 
-        mean = image.mean()
-        std = image.std()
+        mean = np.mean(
+            image
+        )
+
+        std = np.std(
+            image
+        )
 
         if std < 1e-8:
-            return image - mean
+            return (
+                image - mean
+            ).astype(
+                np.float32
+            )
 
-        return (image - mean) / std
+        return (
+            (image - mean)
+            / std
+        ).astype(
+            np.float32
+        )
 
-    def _normalize(self, images):
+    def _normalize(
+        self,
+        images,
+    ):
         """
         Apply z-score normalization independently
         to each MRI modality.
@@ -364,6 +561,7 @@ class BrainTumorDataset(Dataset):
         for channel in range(
             images.shape[0]
         ):
+
             normalized[channel] = (
                 self._zscore(
                     images[channel]
@@ -372,9 +570,9 @@ class BrainTumorDataset(Dataset):
 
         return normalized
 
-    # -----------------------------------------------------------------
-    # 2-D affine augmentation
-    # -----------------------------------------------------------------
+    # ==================================================================
+    # Affine augmentation
+    # ==================================================================
 
     @staticmethod
     def _affine_transform_2d(
@@ -388,21 +586,27 @@ class BrainTumorDataset(Dataset):
         """
         Apply centered 2-D rotation and scaling.
 
-        scipy.ndimage.affine_transform expects
-        an inverse coordinate mapping.
+        The same geometric transformation is applied to all
+        modalities and to the segmentation masks, with nearest
+        neighbor interpolation used for discrete masks.
         """
 
-        height, width = array.shape
+        height, width = (
+            array.shape
+        )
 
         angle = np.deg2rad(
             angle_degrees
         )
 
-        cos_a = np.cos(angle)
-        sin_a = np.sin(angle)
+        cos_a = np.cos(
+            angle
+        )
 
-        # Forward transformation:
-        # rotation followed by scaling.
+        sin_a = np.sin(
+            angle
+        )
+
         forward = np.array(
             [
                 [
@@ -417,9 +621,7 @@ class BrainTumorDataset(Dataset):
             dtype=np.float64,
         )
 
-        # scipy.ndimage.affine_transform
-        # expects inverse mapping.
-        matrix = np.linalg.inv(
+        inverse = np.linalg.inv(
             forward
         )
 
@@ -432,12 +634,13 @@ class BrainTumorDataset(Dataset):
         )
 
         offset = (
-            center - matrix @ center
+            center
+            - inverse @ center
         )
 
-        transformed = affine_transform(
+        return affine_transform(
             array,
-            matrix=matrix,
+            matrix=inverse,
             offset=offset,
             output_shape=(
                 height,
@@ -446,24 +649,24 @@ class BrainTumorDataset(Dataset):
             order=order,
             mode=mode,
             cval=cval,
-            prefilter=(order > 1),
+            prefilter=(
+                order > 1
+            ),
         )
-
-        return transformed
 
     def _augment(
         self,
         images,
         mask,
+        brain_mask,
     ):
         """
-        Apply synchronized spatial augmentation to
-        MRI modalities and segmentation mask.
+        Apply synchronized spatial augmentation.
         """
 
-        # -------------------------------------------------------------
-        # Random horizontal flip
-        # -------------------------------------------------------------
+        # --------------------------------------------------------------
+        # Horizontal flip
+        # --------------------------------------------------------------
 
         if np.random.rand() < 0.5:
 
@@ -477,9 +680,15 @@ class BrainTumorDataset(Dataset):
                 axis=1,
             ).copy()
 
-        # -------------------------------------------------------------
-        # Random vertical flip
-        # -------------------------------------------------------------
+            if brain_mask is not None:
+                brain_mask = np.flip(
+                    brain_mask,
+                    axis=1,
+                ).copy()
+
+        # --------------------------------------------------------------
+        # Vertical flip
+        # --------------------------------------------------------------
 
         if np.random.rand() < 0.5:
 
@@ -493,11 +702,20 @@ class BrainTumorDataset(Dataset):
                 axis=0,
             ).copy()
 
-        # -------------------------------------------------------------
-        # Small-angle rotation
-        # -------------------------------------------------------------
+            if brain_mask is not None:
+                brain_mask = np.flip(
+                    brain_mask,
+                    axis=0,
+                ).copy()
 
-        if np.random.rand() < 0.5:
+        # --------------------------------------------------------------
+        # Rotation
+        # --------------------------------------------------------------
+
+        if (
+            self.rotation_degrees > 0
+            and np.random.rand() < 0.5
+        ):
 
             angle = np.random.uniform(
                 -self.rotation_degrees,
@@ -505,7 +723,9 @@ class BrainTumorDataset(Dataset):
             )
 
             transformed_images = (
-                np.empty_like(images)
+                np.empty_like(
+                    images
+                )
             )
 
             for channel in range(
@@ -523,8 +743,6 @@ class BrainTumorDataset(Dataset):
                     cval=0.0,
                 )
 
-            # Nearest-neighbor interpolation
-            # preserves discrete segmentation labels.
             mask = self._affine_transform_2d(
                 mask,
                 angle_degrees=angle,
@@ -532,15 +750,37 @@ class BrainTumorDataset(Dataset):
                 order=0,
                 mode="constant",
                 cval=0,
-            ).astype(mask.dtype)
+            ).astype(
+                mask.dtype
+            )
+
+            if brain_mask is not None:
+
+                brain_mask = (
+                    self._affine_transform_2d(
+                        brain_mask,
+                        angle_degrees=angle,
+                        scale=1.0,
+                        order=0,
+                        mode="constant",
+                        cval=0,
+                    )
+                    .astype(
+                        brain_mask.dtype
+                    )
+                )
 
             images = transformed_images
 
-        # -------------------------------------------------------------
-        # Random scaling
-        # -------------------------------------------------------------
+        # --------------------------------------------------------------
+        # Scaling
+        # --------------------------------------------------------------
 
-        if np.random.rand() < 0.5:
+        if (
+            self.scale_range[0]
+            != self.scale_range[1]
+            and np.random.rand() < 0.5
+        ):
 
             scale = np.random.uniform(
                 self.scale_range[0],
@@ -548,7 +788,9 @@ class BrainTumorDataset(Dataset):
             )
 
             transformed_images = (
-                np.empty_like(images)
+                np.empty_like(
+                    images
+                )
             )
 
             for channel in range(
@@ -566,8 +808,6 @@ class BrainTumorDataset(Dataset):
                     cval=0.0,
                 )
 
-            # Nearest-neighbor interpolation
-            # preserves discrete segmentation labels.
             mask = self._affine_transform_2d(
                 mask,
                 angle_degrees=0.0,
@@ -575,15 +815,37 @@ class BrainTumorDataset(Dataset):
                 order=0,
                 mode="constant",
                 cval=0,
-            ).astype(mask.dtype)
+            ).astype(
+                mask.dtype
+            )
+
+            if brain_mask is not None:
+
+                brain_mask = (
+                    self._affine_transform_2d(
+                        brain_mask,
+                        angle_degrees=0.0,
+                        scale=scale,
+                        order=0,
+                        mode="constant",
+                        cval=0,
+                    )
+                    .astype(
+                        brain_mask.dtype
+                    )
+                )
 
             images = transformed_images
 
-        return images, mask
+        return (
+            images,
+            mask,
+            brain_mask,
+        )
 
-    # -----------------------------------------------------------------
-    # Mask validation
-    # -----------------------------------------------------------------
+    # ==================================================================
+    # Label validation
+    # ==================================================================
 
     def _validate_mask(
         self,
@@ -591,15 +853,23 @@ class BrainTumorDataset(Dataset):
         mask_path,
     ):
         """
-        Validate segmentation labels and enforce the
-        dataset-specific MOTUM edema constraint.
+        Validate the four-class segmentation label space.
+
+        No automatic relabeling is performed here.
         """
 
-        unique_labels = np.unique(mask)
+        unique_labels = np.unique(
+            mask
+        )
 
-        if np.any(unique_labels < 0) or np.any(
-            unique_labels >= self.num_classes
+        if (
+            np.any(unique_labels < 0)
+            or np.any(
+                unique_labels
+                >= self.num_classes
+            )
         ):
+
             raise ValueError(
                 f"Invalid labels in {mask_path}: "
                 f"{unique_labels.tolist()}. "
@@ -607,92 +877,185 @@ class BrainTumorDataset(Dataset):
                 f"[0, {self.num_classes - 1}]."
             )
 
-        # MOTUM does not contain an independently
-        # annotated edema class.
+        # --------------------------------------------------------------
+        # MOTUM class availability
+        # --------------------------------------------------------------
+
         if (
             self.dataset_name == "MOTUM"
             and 2 in unique_labels
         ):
+
             raise ValueError(
-                f"MOTUM mask '{mask_path}' "
-                f"contains label 2 (ED). "
-                "MOTUM does not provide an "
-                "independently annotated edema class. "
-                "Do not create an artificial edema "
-                "label during preprocessing."
+                f"MOTUM mask '{mask_path}' contains label 2 "
+                f"(Edema), although the configured MOTUM output "
+                f"space marks edema as unavailable. "
+                f"Do not create an artificial edema label."
             )
 
-    # -----------------------------------------------------------------
+    # ==================================================================
+    # Brain-mask validation
+    # ==================================================================
+
+    @staticmethod
+    def _validate_brain_mask(
+        brain_mask,
+        path,
+    ):
+        """
+        Validate the binary brain mask used by MBNSS.
+        """
+
+        unique_values = np.unique(
+            brain_mask
+        )
+
+        if np.any(
+            ~np.isin(
+                unique_values,
+                [0, 1],
+            )
+        ):
+
+            raise ValueError(
+                f"Brain mask '{path}' must be binary "
+                f"(0/1). Found values: "
+                f"{unique_values.tolist()}."
+            )
+
+    # ==================================================================
     # Dataset item
-    # -----------------------------------------------------------------
+    # ==================================================================
 
-    def __getitem__(self, index):
+    def __getitem__(
+        self,
+        index,
+    ):
+        """
+        Return one 2-D multimodal MRI slice.
 
-        case_dir = self.cases[index]
+        Returned fields
+        ---------------
+
+        image:
+            [4, H, W] float32 tensor
+
+        mask:
+            [H, W] int64 tensor
+
+        brain_mask:
+            [H, W] float32 tensor, or None
+
+        patient_id:
+            Patient identifier
+
+        slice_id:
+            Slice identifier
+
+        case_id:
+            patient_id + slice_id
+
+        dataset:
+            Dataset name
+
+        valid_classes:
+            [4] boolean class-availability vector
+
+        pixel_spacing:
+            [2] tensor containing
+            [row_spacing_mm, column_spacing_mm]
+        """
+
+        sample = self.samples[
+            index
+        ]
 
         (
             images,
             mask,
+            brain_mask,
             pixel_spacing,
-        ) = self._load_case(
-            case_dir
+        ) = self._load_sample(
+            sample
         )
 
-        # -------------------------------------------------------------
-        # Per-modality z-score normalization
-        # -------------------------------------------------------------
+        # --------------------------------------------------------------
+        # Normalize MRI modalities
+        # --------------------------------------------------------------
 
         images = self._normalize(
             images
         )
 
-        # -------------------------------------------------------------
+        # --------------------------------------------------------------
         # Training augmentation
-        # -------------------------------------------------------------
+        # --------------------------------------------------------------
 
         if self.augment:
 
-            images, mask = self._augment(
+            (
                 images,
                 mask,
+                brain_mask,
+            ) = self._augment(
+                images,
+                mask,
+                brain_mask,
             )
 
-        # -------------------------------------------------------------
+        # --------------------------------------------------------------
         # Input-size validation
-        # -------------------------------------------------------------
+        # --------------------------------------------------------------
 
-        if images.shape[1:] != self.image_size:
+        if (
+            images.shape[1:]
+            != self.image_size
+        ):
 
             raise ValueError(
                 f"Expected image size "
-                f"{self.image_size}, "
-                f"but case '{case_dir.name}' "
-                f"has image size "
+                f"{self.image_size}, but "
+                f"'{sample['case_id']}' has "
+                f"image size "
                 f"{images.shape[1:]}. "
-                "Resize/resample the data "
-                "during preprocessing."
+                f"Resize/resample the data during "
+                f"preprocessing."
             )
 
-        # -------------------------------------------------------------
-        # Mask validation
-        # -------------------------------------------------------------
+        # --------------------------------------------------------------
+        # Validate segmentation mask
+        # --------------------------------------------------------------
 
         mask = mask.astype(
             np.int64
         )
 
-        mask_path = (
-            case_dir / "mask.npy"
-        )
-
         self._validate_mask(
             mask,
-            mask_path,
+            sample["path"] / "mask.npy",
         )
 
-        # -------------------------------------------------------------
+        # --------------------------------------------------------------
+        # Validate brain mask
+        # --------------------------------------------------------------
+
+        if brain_mask is not None:
+
+            brain_mask = (
+                brain_mask.astype(
+                    np.float32
+                )
+            )
+
+            self._validate_brain_mask(
+                brain_mask,
+                sample["path"]
+                / "brain_mask.npy",
+            )
+
+        # --------------------------------------------------------------
         # Dataset-specific valid classes
-        # -------------------------------------------------------------
+        # --------------------------------------------------------------
 
         valid_classes = torch.tensor(
             self.DATASET_VALID_CLASSES[
@@ -701,31 +1064,82 @@ class BrainTumorDataset(Dataset):
             dtype=torch.bool,
         )
 
-        # -------------------------------------------------------------
+        # --------------------------------------------------------------
         # Convert to tensors
-        # -------------------------------------------------------------
+        # --------------------------------------------------------------
 
-        images = torch.from_numpy(
+        image_tensor = torch.from_numpy(
             images.astype(
                 np.float32
             )
         )
 
-        mask = torch.from_numpy(
+        mask_tensor = torch.from_numpy(
             mask
         )
 
-        pixel_spacing = torch.from_numpy(
-            pixel_spacing.astype(
-                np.float32
+        if brain_mask is not None:
+
+            brain_mask_tensor = (
+                torch.from_numpy(
+                    brain_mask
+                )
+            )
+
+        else:
+
+            brain_mask_tensor = None
+
+        spacing_tensor = (
+            torch.from_numpy(
+                pixel_spacing.astype(
+                    np.float32
+                )
             )
         )
 
         return {
-            "image": images,
-            "mask": mask,
-            "case_id": case_dir.name,
+            "image": image_tensor,
+            "mask": mask_tensor,
+            "brain_mask": brain_mask_tensor,
+            "patient_id": sample[
+                "patient_id"
+            ],
+            "slice_id": sample[
+                "slice_id"
+            ],
+            "case_id": sample[
+                "case_id"
+            ],
             "dataset": self.dataset_name,
             "valid_classes": valid_classes,
-            "pixel_spacing": pixel_spacing,
+            "pixel_spacing": spacing_tensor,
         }
+
+
+# ======================================================================
+# Utility
+# ======================================================================
+
+def get_dataset_valid_classes(
+    dataset_name,
+):
+    """
+    Return the configured class-availability vector for a dataset.
+    """
+
+    if dataset_name not in (
+        BrainTumorDataset
+        .DATASET_VALID_CLASSES
+    ):
+        raise ValueError(
+            f"Unsupported dataset '{dataset_name}'."
+        )
+
+    return torch.tensor(
+        BrainTumorDataset
+        .DATASET_VALID_CLASSES[
+            dataset_name
+        ],
+        dtype=torch.bool,
+    )
