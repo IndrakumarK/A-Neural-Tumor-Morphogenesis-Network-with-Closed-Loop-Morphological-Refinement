@@ -1,11 +1,87 @@
+"""
+NTMN Morphology Module.
+
+Differentiable prediction-derived morphological descriptors for
+Neural Tumor Morphogenesis Network (NTMN).
+
+Six descriptor groups are represented by nine scalar values:
+
+    1. Area             -> 1
+    2. Centroid         -> 2 (cx, cy)
+    3. Covariance       -> 3 (Cxx, Cxy, Cyy)
+    4. Elongation       -> 1
+    5. Soft boundary    -> 1
+    6. Soft compactness -> 1
+
+Total morphology dimension = 9.
+
+The function operates on a soft foreground probability map with
+shape [B, 1, H, W] and preserves differentiability so that the
+morphological representation can participate in end-to-end training.
+"""
+
 import torch
 
-def morphology(mask, eps=1e-6):
-    
-    if mask.ndim != 4 or mask.shape[1] != 1:
+
+def morphology(
+    mask: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Extract differentiable morphology descriptors from a soft
+    foreground probability map.
+
+    Parameters
+    ----------
+    mask : torch.Tensor
+        Soft foreground probability map with shape:
+
+            [B, 1, H, W]
+
+        Values are expected to lie in [0, 1].
+
+    eps : float, optional
+        Numerical stability constant.
+
+    Returns
+    -------
+    torch.Tensor
+        Nine-dimensional morphology representation with shape:
+
+            [B, 9]
+
+        Descriptor ordering:
+
+            [area,
+             centroid_x,
+             centroid_y,
+             covariance_xx,
+             covariance_xy,
+             covariance_yy,
+             elongation,
+             soft_boundary,
+             soft_compactness]
+    """
+
+    # =================================================================
+    # Input validation
+    # =================================================================
+
+    if not torch.is_tensor(mask):
+        raise TypeError(
+            "mask must be a torch.Tensor."
+        )
+
+    if mask.ndim != 4:
         raise ValueError(
             "mask must have shape [B, 1, H, W], "
             f"got {tuple(mask.shape)}"
+        )
+
+    if mask.shape[1] != 1:
+        raise ValueError(
+            "mask must have exactly one foreground channel, "
+            f"got {mask.shape[1]} channels."
         )
 
     batch_size, _, height, width = mask.shape
@@ -15,12 +91,16 @@ def morphology(mask, eps=1e-6):
             "mask spatial dimensions must be at least 2x2."
         )
 
-    dtype = mask.dtype
-    device = mask.device
+    if not torch.is_floating_point(mask):
+        mask = mask.float()
 
-    # -------------------------------------------------------------
+    device = mask.device
+    dtype = mask.dtype
+
+    # =================================================================
     # Coordinate grid
-    # -------------------------------------------------------------
+    # =================================================================
+
     yy, xx = torch.meshgrid(
         torch.arange(
             height,
@@ -38,14 +118,19 @@ def morphology(mask, eps=1e-6):
     xx = xx.unsqueeze(0)
     yy = yy.unsqueeze(0)
 
+    # =================================================================
+    # Soft foreground
+    # =================================================================
+
     m = mask[:, 0].clamp(
         min=0.0,
         max=1.0,
     )
 
-    # -------------------------------------------------------------
+    # =================================================================
     # 1. Soft area
-    # -------------------------------------------------------------
+    # =================================================================
+
     area = (
         m.sum(
             dim=(1, 2),
@@ -54,10 +139,13 @@ def morphology(mask, eps=1e-6):
         + eps
     )
 
-    # -------------------------------------------------------------
+    area_scalar = area.flatten(1)
+
+    # =================================================================
     # 2. Soft centroid
-    # -------------------------------------------------------------
-    cx = (
+    # =================================================================
+
+    centroid_x = (
         (m * xx).sum(
             dim=(1, 2),
             keepdim=True,
@@ -65,7 +153,7 @@ def morphology(mask, eps=1e-6):
         / area
     )
 
-    cy = (
+    centroid_y = (
         (m * yy).sum(
             dim=(1, 2),
             keepdim=True,
@@ -73,21 +161,34 @@ def morphology(mask, eps=1e-6):
         / area
     )
 
-    # -------------------------------------------------------------
-    # Centered coordinates
-    # -------------------------------------------------------------
-    dx = xx - cx
-    dy = yy - cy
+    centroid_x = centroid_x.flatten(1)
+    centroid_y = centroid_y.flatten(1)
 
-    # -------------------------------------------------------------
+    # =================================================================
+    # Centered coordinates
+    # =================================================================
+
+    dx = (
+        xx
+        - centroid_x.unsqueeze(-1).unsqueeze(-1)
+    )
+
+    dy = (
+        yy
+        - centroid_y.unsqueeze(-1).unsqueeze(-1)
+    )
+
+    # =================================================================
     # 3. Soft covariance
     #
-    # Covariance components:
-    #   Cxx
-    #   Cxy
-    #   Cyy
-    # -------------------------------------------------------------
-    cxx = (
+    # Covariance representation:
+    #
+    #     Cxx
+    #     Cxy
+    #     Cyy
+    # =================================================================
+
+    covariance_xx = (
         (m * dx.pow(2)).sum(
             dim=(1, 2),
             keepdim=True,
@@ -95,16 +196,16 @@ def morphology(mask, eps=1e-6):
         / area
     )
 
-    cyy = (
-        (m * dy.pow(2)).sum(
+    covariance_xy = (
+        (m * dx * dy).sum(
             dim=(1, 2),
             keepdim=True,
         )
         / area
     )
 
-    cxy = (
-        (m * dx * dy).sum(
+    covariance_yy = (
+        (m * dy.pow(2)).sum(
             dim=(1, 2),
             keepdim=True,
         )
@@ -113,22 +214,32 @@ def morphology(mask, eps=1e-6):
 
     covariance = torch.cat(
         [
-            cxx.flatten(1),
-            cxy.flatten(1),
-            cyy.flatten(1),
+            covariance_xx.flatten(1),
+            covariance_xy.flatten(1),
+            covariance_yy.flatten(1),
         ],
         dim=1,
     )
 
-    # -------------------------------------------------------------
+    # =================================================================
     # 4. Elongation
-    # -------------------------------------------------------------
+    #
+    # Construct the 2 x 2 covariance matrix:
+    #
+    #     [ Cxx  Cxy ]
+    #     [ Cxy  Cyy ]
+    #
+    # Elongation is defined as:
+    #
+    #     sqrt(lambda_max / lambda_min)
+    # =================================================================
+
     covariance_matrix = torch.stack(
         [
-            cxx.flatten(),
-            cxy.flatten(),
-            cxy.flatten(),
-            cyy.flatten(),
+            covariance_xx.flatten(),
+            covariance_xy.flatten(),
+            covariance_xy.flatten(),
+            covariance_yy.flatten(),
         ],
         dim=1,
     ).reshape(
@@ -145,16 +256,31 @@ def morphology(mask, eps=1e-6):
         eps
     )
 
+    lambda_min = eigenvalues[:, 0]
+    lambda_max = eigenvalues[:, 1]
+
     elongation = (
-        eigenvalues[:, 1]
-        / eigenvalues[:, 0]
+        lambda_max
+        / (lambda_min + eps)
     ).sqrt().unsqueeze(1)
 
-    # -------------------------------------------------------------
+    # =================================================================
     # 5. Soft boundary
-    # -------------------------------------------------------------
-    horizontal_gradient = torch.zeros_like(m)
-    vertical_gradient = torch.zeros_like(m)
+    #
+    # A differentiable boundary-magnitude surrogate is obtained from
+    # horizontal and vertical first-order differences.
+    #
+    # This is intentionally a normalized soft boundary descriptor
+    # rather than a hard binary perimeter.
+    # =================================================================
+
+    horizontal_gradient = torch.zeros_like(
+        m
+    )
+
+    vertical_gradient = torch.zeros_like(
+        m
+    )
 
     horizontal_gradient[:, :, :-1] = torch.abs(
         m[:, :, 1:]
@@ -173,9 +299,16 @@ def morphology(mask, eps=1e-6):
         dim=(1, 2)
     ).unsqueeze(1)
 
-    # -------------------------------------------------------------
+    # =================================================================
     # 6. Soft compactness
-    # -------------------------------------------------------------
+    #
+    # Compactness follows the area-to-boundary relationship:
+    #
+    #     4*pi*A / B^2
+    #
+    # where B is the differentiable soft-boundary magnitude.
+    # =================================================================
+
     perimeter_proxy = (
         boundary + eps
     )
@@ -183,30 +316,59 @@ def morphology(mask, eps=1e-6):
     compactness = (
         4.0
         * torch.pi
-        * area.flatten(1)
+        * area_scalar
         / perimeter_proxy.pow(2)
     )
 
-    # -------------------------------------------------------------
-    # Final morphology vector
-    # -------------------------------------------------------------
+    # =================================================================
+    # Final nine-dimensional morphology representation
+    # =================================================================
+
     descriptors = torch.cat(
         [
-            area.flatten(1),
-            cx.flatten(1),
-            cy.flatten(1),
+            # 1: area
+            area_scalar,
+
+            # 2: centroid
+            centroid_x,
+            centroid_y,
+
+            # 3: covariance
             covariance,
+
+            # 4: elongation
             elongation,
+
+            # 5: soft boundary
             boundary,
+
+            # 6: soft compactness
             compactness,
         ],
         dim=1,
     )
 
-    if descriptors.shape[1] != 9:
+    # =================================================================
+    # Final consistency check
+    # =================================================================
+
+    if descriptors.shape != (
+        batch_size,
+        9,
+    ):
         raise RuntimeError(
-            "Expected a 9-dimensional morphology vector, "
-            f"got {descriptors.shape[1]}."
+            "Expected morphology representation with shape "
+            f"[{batch_size}, 9], "
+            f"got {tuple(descriptors.shape)}."
+        )
+
+    # Ensure numerical validity.
+    if not torch.isfinite(
+        descriptors
+    ).all():
+        raise RuntimeError(
+            "Non-finite values detected in the morphology "
+            "descriptor representation."
         )
 
     return descriptors
