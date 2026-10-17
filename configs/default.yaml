@@ -1,9 +1,10 @@
-# KE-NTMN Default Configuration
+# NTMN Default Configuration
 project:
-  name: "KE-NTMN"
+  name: "NTMN"
   task: "multimodal_brain_tumor_segmentation"
   seed: 42
   device: "cuda"
+
 # ---------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------
@@ -22,6 +23,7 @@ data:
   dimension: "2D"
 
   normalize: "zscore_per_modality"
+
   # Patient-level partitioning:
   # UPenn-GBM: 70/15/15
   # TCGA-GBM: 70/15/15
@@ -34,6 +36,7 @@ data:
 
   augmentation:
     enabled: true
+
     horizontal_flip: true
     vertical_flip: true
 
@@ -47,7 +50,10 @@ data:
       min: 0.90
       max: 1.10
 
-   valid_classes:
+  # Dataset-specific availability of the four-class output space.
+  # Verify the exact dataset-specific class mapping in the
+  # preprocessing/data-loading implementation before finalizing.
+  valid_classes:
     UPenn-GBM: [true, true, true, true]
     TCGA-GBM: [true, true, true, true]
     MOTUM: [true, true, false, true]
@@ -57,7 +63,7 @@ data:
 # Model
 # ---------------------------------------------------------------------
 model:
-  name: "KE-NTMN"
+  name: "NTMN"
 
   input_channels: 4
   num_classes: 4
@@ -85,9 +91,10 @@ model:
       - soft_boundary
       - soft_compactness
 
+    # Tumor morphology descriptors are used in their computed form.
+    # No descriptor normalization is assumed in the current manuscript.
     descriptor_normalization:
-      enabled: true
-      statistics: "training_set_only"
+      enabled: false
 
   knowledge_feedback:
     enabled: true
@@ -142,7 +149,7 @@ training:
 # ---------------------------------------------------------------------
 loss:
 
-  # Main KE-NTMN segmentation objective
+  # Main NTMN segmentation objective
   foreground_dice: 1.00
   structural_stability: 0.20
   morphology_estimation: 0.20
@@ -170,7 +177,6 @@ evaluation:
     - IoU
     - HD95
     - precision
-    - recall
     - sensitivity
     - specificity
 
